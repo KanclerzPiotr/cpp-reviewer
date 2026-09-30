@@ -100,18 +100,6 @@ std::vector<std::string> filterArgs(const std::vector<std::string>& raw, const s
     return out;
 }
 
-std::string replaceAll(std::string s, const std::string& from, const std::string& to)
-{
-    if (from.empty())
-        return s;
-    size_t pos = 0;
-    while ((pos = s.find(from, pos)) != std::string::npos) {
-        s.replace(pos, from.size(), to);
-        pos += to.size();
-    }
-    return s;
-}
-
 } // namespace
 
 std::string CompileDatabase::find(const std::string& projectRoot)
@@ -177,7 +165,34 @@ bool CompileDatabase::load(const std::string& jsonPath, std::string* error)
     return true;
 }
 
-const CompileDatabase::Entry* CompileDatabase::lookup(const std::string& absFile) const
+// Points a path argument ("/p", "-I/p", "-include /p" value...) under `from` into the snapshot at `to`.
+// Paths that only exist in the project, such as the build directory with generated headers and
+// downloaded dependencies, aren't part of an exported commit and keep pointing into the project.
+std::string CompileDatabase::remap(const std::string& arg, const std::string& from, const std::string& to) const
+{
+    auto pos = arg.find(from);
+    if (pos == std::string::npos)
+        return arg;
+    const auto rest = arg.substr(pos + from.size());
+    if (!rest.empty() && rest.front() != '/')
+        return arg; // "/repo-2" is not inside "/repo"
+    auto candidate = to + rest;
+    bool exists;
+    {
+        std::lock_guard lock(existsMutex_);
+        auto it = exists_.find(candidate);
+        if (it != exists_.end()) {
+            exists = it->second;
+        } else {
+            std::error_code ec;
+            exists = fs::exists(candidate, ec);
+            exists_.emplace(candidate, exists);
+        }
+    }
+    return exists ? arg.substr(0, pos) + candidate : arg;
+}
+
+const CompileDatabase::Entry* CompileDatabase::lookup(const std::string& absFile, bool allowGuess) const
 {
     if (entries_.empty())
         return nullptr;
@@ -198,8 +213,15 @@ const CompileDatabase::Entry* CompileDatabase::lookup(const std::string& absFile
         if (dir == dir.root_path())
             break;
     }
+    if (!allowGuess)
+        return nullptr;
     // A sibling "src" directory usually shares flags with "include".
     return &entries_.begin()->second;
+}
+
+bool CompileDatabase::covers(const std::string& projectRoot, const std::string& relPath) const
+{
+    return lookup((fs::path(projectRoot) / relPath).lexically_normal().string(), false) != nullptr;
 }
 
 std::vector<std::string> CompileDatabase::argsFor(const std::string& projectRoot, const std::string& snapshotRoot,
@@ -211,7 +233,7 @@ std::vector<std::string> CompileDatabase::argsFor(const std::string& projectRoot
         return fallbackArgs(snapshotRoot, relPath);
 
     std::vector<std::string> args;
-    const bool remap = fs::path(projectRoot).lexically_normal() != fs::path(snapshotRoot).lexically_normal();
+    const bool inSnapshot = fs::path(projectRoot).lexically_normal() != fs::path(snapshotRoot).lexically_normal();
     auto from = fs::path(projectRoot).lexically_normal().string();
     auto to = fs::path(snapshotRoot).lexically_normal().string();
     for (size_t i = 0; i < e->args.size(); ++i) {
@@ -222,7 +244,7 @@ std::vector<std::string> CompileDatabase::argsFor(const std::string& projectRoot
         }
         if (a.rfind("-x", 0) == 0)
             continue;
-        args.push_back(remap ? replaceAll(a, from, to) : a);
+        args.push_back(inSnapshot ? remap(a, from, to) : a);
     }
     // Includes of the snapshot must win over the (possibly generated) ones from the build dir.
     args.push_back("-I" + to);

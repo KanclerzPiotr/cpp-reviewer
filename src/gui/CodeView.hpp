@@ -4,8 +4,10 @@
 #include "core/Review.hpp"
 
 #include <QPlainTextEdit>
+#include <QTextDocument>
 #include <QTimer>
 #include <functional>
+#include <optional>
 
 namespace gui {
 
@@ -18,6 +20,9 @@ struct RowData {
     cr::LineTag tag = cr::LineTag::None;
     int change = -1; // semantic change index
     QVector<QPair<int, int>> spans; // intraline highlights (start, length) in QString characters
+    int display = -1;  // line number to show instead of line + 1 (0: none), for generated text
+    int hunk = -1;     // index of the diff hunk the row belongs to
+    bool fold = false; // placeholder for a hunk hidden as reviewed (line == -1)
 };
 
 struct ChangeMeta {
@@ -25,6 +30,8 @@ struct ChangeMeta {
     QColor color;
     QString title;
 };
+
+enum class BookmarkAction { Toggle, EditComment, Remove };
 
 // Read-only source view with line numbers, diff backgrounds, change badges and
 // IDE-like navigation gestures (Ctrl+click, F12, hover).
@@ -42,7 +49,11 @@ public:
     }
     // Re-applies colors after the theme changed.
     void refreshTheme();
+    // Repaints bookmarks after they changed.
+    void refreshMarks();
     void setChangeMetaProvider(std::function<ChangeMeta(int)> p) { changeMeta_ = std::move(p); }
+    // Enables "mark hunk as reviewed" actions; tells whether a hunk is marked.
+    void setHunkReviewedProvider(std::function<bool(int)> p) { hunkReviewed_ = std::move(p); }
 
     cr::Side side() const { return side_; }
     const QString& path() const { return path_; }
@@ -53,6 +64,17 @@ public:
     int lineForRow(int row) const;    // -1 for fillers
     // Highlights every whole-word occurrence of `word` (empty clears); kept across setContent().
     void setHighlightWord(const QString& word);
+    // Find-bar matches: highlights all of them (empty clears); findNext() selects the next one
+    // after the cursor, wrapping around. Placeholder rows are skipped.
+    void setSearch(const QString& text, QTextDocument::FindFlags flags);
+    bool findNext(bool backward);
+    int searchMatchCount() const { return searchMatches_; }
+
+    // Bookmarks of all views: returns the comment ("" for a plain bookmark) of a bookmarked line
+    // (0-based) of `path` on `side`, or nullopt.
+    using BookmarkProvider = std::function<std::optional<QString>(cr::Side side, const QString& path, int line)>;
+    static void setBookmarkProvider(BookmarkProvider p);
+    void setOpenFileEnabled(bool on) { openFileEnabled_ = on; }
     void scrollToRow(int row, bool flash);
     void flashRow(int row);
     void scrollToLine(int line, bool flash) { scrollToRow(rowForLine(line), flash); }
@@ -68,12 +90,18 @@ signals:
     void definitionRequested(gui::CodeView* view, int row, int column, bool declaration);
     void hoverRequested(gui::CodeView* view, int row, int column, QPoint globalPos);
     void changeActivated(int change);
+    void foldActivated(int hunk);
+    void hunkReviewRequested(int hunk, bool reviewed);
+    void bookmarkRequested(gui::CodeView* view, int line, gui::BookmarkAction action);
+    void openFileRequested(cr::Side side, const QString& path, int line);
 
 protected:
     void resizeEvent(QResizeEvent* e) override;
+    void paintEvent(QPaintEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
     void mousePressEvent(QMouseEvent* e) override;
     void mouseReleaseEvent(QMouseEvent* e) override;
+    void mouseDoubleClickEvent(QMouseEvent* e) override;
     void keyPressEvent(QKeyEvent* e) override;
     void keyReleaseEvent(QKeyEvent* e) override;
     void leaveEvent(QEvent* e) override;
@@ -96,6 +124,13 @@ private:
     QString path_;
     bool external_ = false;
     std::function<ChangeMeta(int)> changeMeta_;
+    std::function<bool(int)> hunkReviewed_;
+    std::optional<QString> bookmarkAt(int row) const;
+    static BookmarkProvider bookmarks_;
+    bool openFileEnabled_ = false;
+    QString search_;
+    QTextDocument::FindFlags searchFlags_;
+    int searchMatches_ = 0;
 
     QTimer hoverTimer_;
     QPoint hoverPos_;

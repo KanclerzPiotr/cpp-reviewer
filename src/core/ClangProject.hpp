@@ -49,8 +49,12 @@ public:
 
     // Parses all C/C++ files (without function bodies) to map USRs to definitions and
     // declarations. Can be cancelled; safe to call from a background thread.
+    // Results are cached per file (content + compile flags) in the cache directory, so only files
+    // that changed since an earlier review are parsed again.
     void buildIndex(const std::function<void(int done, int total)>& progress, const std::atomic<bool>& cancel);
     bool indexReady() const { return indexReady_; }
+    int indexCacheHits() const { return cacheHits_; }
+    int indexedFiles() const { return indexedFiles_; }
 
     std::vector<Location> definitionsOf(const std::string& usr) const;
     std::vector<Location> declarationsOf(const std::string& usr) const;
@@ -78,6 +82,7 @@ private:
     std::unordered_map<std::string, std::vector<Location>> defs_;
     std::unordered_map<std::string, std::vector<Location>> decls_;
     std::atomic<bool> indexReady_{false};
+    std::atomic<int> cacheHits_{0}, indexedFiles_{0};
 };
 
 } // namespace cr

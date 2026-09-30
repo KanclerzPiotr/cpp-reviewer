@@ -1,7 +1,10 @@
 #include "Git.hpp"
 
+#include "Json.hpp"
 #include "Process.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 
@@ -13,10 +16,11 @@ namespace {
 
 std::string trim(std::string s)
 {
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+    auto space = [](char c) { return c == '\n' || c == '\r' || c == ' ' || c == '\t'; };
+    while (!s.empty() && space(s.back()))
         s.pop_back();
     size_t i = 0;
-    while (i < s.size() && s[i] == ' ')
+    while (i < s.size() && space(s[i]))
         ++i;
     return s.substr(i);
 }
@@ -53,6 +57,34 @@ std::optional<GitRepo> GitRepo::open(const std::string& path)
     if (!r.ok())
         return std::nullopt;
     return GitRepo(trim(r.out));
+}
+
+std::optional<GitRepo> GitRepo::openBare(const std::string& dir, std::string* error)
+{
+    std::error_code ec;
+    if (!fs::exists(fs::path(dir) / "HEAD", ec)) {
+        fs::create_directories(dir, ec);
+        auto r = runProcess({"git", "init", "--quiet", "--bare", dir});
+        if (!r.ok()) {
+            if (error)
+                *error = r.err;
+            return std::nullopt;
+        }
+    }
+    return GitRepo(dir);
+}
+
+std::optional<std::string> GitRepo::fileAt(const std::string& sha, const std::string& path) const
+{
+    auto r = runProcess(gitArgs(root_, {"cat-file", "blob", sha + ":" + path}));
+    if (!r.ok())
+        return std::nullopt;
+    return std::move(r.out);
+}
+
+std::vector<std::string> GitRepo::listTree(const std::string& sha) const
+{
+    return lines({"ls-tree", "-r", "--name-only", sha});
 }
 
 std::vector<std::string> GitRepo::lines(const std::vector<std::string>& rest) const
@@ -293,6 +325,169 @@ std::string GitRepo::fetchBranch(const std::string& remote, const std::string& b
         return {};
     }
     return resolve("FETCH_HEAD");
+}
+
+std::string GitRepo::remoteFor(const std::string& host, const std::string& slug) const
+{
+    auto lower = [](std::string x) {
+        for (auto& c : x)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return x;
+    };
+    for (const auto& r : remotes()) {
+        std::string h, sl;
+        if (hostAndSlugFromUrl(remoteUrl(r), h, sl) && lower(h) == lower(host) && lower(sl) == lower(slug))
+            return r;
+    }
+    return {};
+}
+
+std::optional<GitRepo::PullRequestMeta> GitRepo::pullRequestMeta(const std::string& remote, int number) const
+{
+    std::string host, slug;
+    if (!hostAndSlugFromUrl(remote.find("://") != std::string::npos ? remote : remoteUrl(remote), host, slug))
+        return std::nullopt;
+    auto r = runProcess({"gh", "pr", "view", std::to_string(number), "--repo", host + "/" + slug, "--json",
+                         "title,state,baseRefName,baseRefOid,headRefOid"},
+                        root_);
+    JsonValue v;
+    if (!r.ok() || !parseJson(r.out, v) || !v.isObject())
+        return std::nullopt;
+    PullRequestMeta m;
+    m.title = v["title"].str();
+    m.state = v["state"].str();
+    m.baseRef = v["baseRefName"].str();
+    m.baseSha = v["baseRefOid"].str();
+    m.headSha = v["headRefOid"].str();
+    if (m.baseRef.empty())
+        return std::nullopt;
+    return m;
+}
+
+GitRepo::FetchedPullRequest GitRepo::fetchPullRequestForReview(const std::string& remote, int number,
+                                                               const std::string& baseRef) const
+{
+    FetchedPullRequest out;
+    const auto pr = std::to_string(number);
+    out.head = fetchPullRequest(remote, number, &out.error);
+    if (out.head.empty()) {
+        out.error = "cannot fetch pull/" + pr + "/head from " + remote + ": " + out.error;
+        return out;
+    }
+    std::string baseTip, baseSha, ignored;
+    std::string ref = baseRef;
+    if (auto meta = pullRequestMeta(remote, number)) {
+        out.title = meta->title;
+        if (ref.empty())
+            ref = meta->baseRef;
+        if (ref == meta->baseRef)
+            baseSha = meta->baseSha;
+    }
+    if (ref.empty()) {
+        // Open, mergeable PRs have a test merge whose first parent is the target branch.
+        if (!fetchBranch(remote, "pull/" + pr + "/merge", &ignored).empty())
+            baseTip = resolve("FETCH_HEAD^1");
+        if (!baseTip.empty()) {
+            out.baseLabel = "merge-base with the target of PR #" + pr;
+        } else {
+            auto l = lines({"ls-remote", "--symref", remote, "HEAD"});
+            if (!l.empty() && l.front().rfind("ref: refs/heads/", 0) == 0)
+                ref = l.front().substr(16, l.front().find('\t') - 16);
+            if (ref.empty())
+                ref = "main";
+        }
+    }
+    if (baseTip.empty()) {
+        baseTip = fetchBranch(remote, ref, &out.error);
+        if (baseTip.empty()) {
+            out.error = "cannot fetch base branch " + ref + ": " + out.error;
+            out.head.clear();
+            return out;
+        }
+        out.baseLabel = "merge-base with " + (remote.find("://") == std::string::npos ? remote + "/" : std::string()) + ref;
+        // Compare against the target as GitHub recorded it; for a merged PR the branch already
+        // contains the PR.
+        if (!baseSha.empty() && resolve(baseSha).empty())
+            fetchBranch(remote, baseSha, &ignored);
+        if (!baseSha.empty() && !resolve(baseSha).empty())
+            baseTip = baseSha;
+    }
+    out.base = mergeBase(baseTip, out.head);
+    if (out.base.empty()) {
+        out.error = "no merge base between the pull request and its target branch";
+        out.head.clear();
+    } else if (out.base == out.head) {
+        out.error = "pull request #" + pr + " is already merged into its target branch, so there is nothing to "
+                    "compare against it; choose the base revision explicitly";
+        out.head.clear();
+    }
+    return out;
+}
+
+bool hostAndSlugFromUrl(const std::string& url, std::string& host, std::string& slug)
+{
+    std::string rest;
+    if (auto p = url.find("://"); p != std::string::npos) {
+        rest = url.substr(p + 3);
+        if (auto at = rest.find('@'); at != std::string::npos && at < rest.find('/'))
+            rest = rest.substr(at + 1); // user@
+        auto slash = rest.find('/');
+        if (slash == std::string::npos)
+            return false;
+        host = rest.substr(0, slash);
+        if (auto colon = host.find(':'); colon != std::string::npos)
+            host.resize(colon); // port
+        rest = rest.substr(slash + 1);
+    } else if (auto colon = url.find(':'); colon != std::string::npos && url.find('@') < colon) {
+        host = url.substr(url.find('@') + 1, colon - url.find('@') - 1); // git@host:owner/repo
+        rest = url.substr(colon + 1);
+    } else {
+        return false;
+    }
+    while (!rest.empty() && rest.back() == '/')
+        rest.pop_back();
+    if (rest.size() > 4 && rest.compare(rest.size() - 4, 4, ".git") == 0)
+        rest.resize(rest.size() - 4);
+    if (host.empty() || std::count(rest.begin(), rest.end(), '/') != 1)
+        return false;
+    slug = rest;
+    return true;
+}
+
+std::optional<PullRequestUrl> parsePullRequestUrl(const std::string& text)
+{
+    // [https://]host/owner/repo/pull/123[/files|/commits...][?query][#anchor]
+    std::string s = text;
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.pop_back();
+    s.erase(0, s.find_first_not_of(" \t\r\n"));
+    if (auto p = s.find("://"); p != std::string::npos)
+        s = s.substr(p + 3);
+    std::vector<std::string> parts;
+    for (size_t b = 0; b <= s.size();) {
+        size_t e = s.find_first_of("/?#", b);
+        if (e == std::string::npos)
+            e = s.size();
+        parts.push_back(s.substr(b, e - b));
+        if (e == s.size() || s[e] != '/')
+            break;
+        b = e + 1;
+    }
+    if (parts.size() < 5 || parts[0].find('.') == std::string::npos || parts[1].empty() || parts[2].empty() ||
+        (parts[3] != "pull" && parts[3] != "pulls"))
+        return std::nullopt;
+    PullRequestUrl u;
+    u.host = parts[0];
+    u.slug = parts[1] + "/" + parts[2];
+    try {
+        size_t used = 0;
+        u.number = std::stoi(parts[4], &used);
+        if (used != parts[4].size() || u.number <= 0)
+            return std::nullopt;
+    } catch (...) {
+        return std::nullopt;
+    }
+    return u;
 }
 
 std::string gitHubSlugFromUrl(const std::string& url)

@@ -274,4 +274,11 @@ std::vector<std::string> listCppFiles(const Snapshot& snap)
     return out;
 }
 
+std::vector<std::string> listFiles(const Snapshot& snap)
+{
+    std::vector<std::string> out;
+    walk(snap.root, out, false);
+    return out;
+}
+
 } // namespace cr

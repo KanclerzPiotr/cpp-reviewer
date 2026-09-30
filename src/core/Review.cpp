@@ -141,7 +141,7 @@ void diffLines(FileDiff& fd, bool ignoreWhitespace)
     };
     fd.oldInfo.assign(fd.oldLines.size(), {});
     fd.newInfo.assign(fd.newLines.size(), {});
-    auto edits = diffSequences(hashLines(fd.oldLines), hashLines(fd.newLines));
+    auto edits = diffLinesReadable(hashLines(fd.oldLines), hashLines(fd.newLines), fd.oldLines, fd.newLines);
 
     std::vector<int> dels, ins;
     auto flush = [&] {

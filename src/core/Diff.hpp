@@ -18,6 +18,13 @@ struct Edit {
 // Myers O(ND) difference with linear space (divide & conquer on the middle snake).
 std::vector<Edit> diffSequences(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b);
 
+// Line diff for display: Myers, then each block of added/removed lines that could equally be
+// placed a few lines up or down (e.g. a new function starting or ending with "}") is slid to where
+// it reads best, using git's indent heuristic. `a`/`b` are the line hashes, `aLines`/`bLines` the
+// text (for indentation and blank lines).
+std::vector<Edit> diffLinesReadable(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b,
+                                    const std::vector<std::string>& aLines, const std::vector<std::string>& bLines);
+
 // Number of equal elements in the diff of a and b (length of the LCS found by Myers).
 int commonLength(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b);
 

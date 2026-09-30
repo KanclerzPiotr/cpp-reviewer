@@ -40,6 +40,10 @@ struct FileDiff {
     std::vector<int> changes; // semantic changes touching this file
     int added = 0, removed = 0;
     int oldErrors = 0, newErrors = 0; // libclang errors (missing includes etc.)
+    // Generated text rather than a file of a revision (e.g. an interdiff): no navigation, and
+    // the gutter shows the display line numbers (0 = none) instead of the document's own.
+    bool synthetic = false;
+    std::vector<int> oldDisplay, newDisplay;
 
     const std::string& path() const { return newPath.empty() ? oldPath : newPath; }
 };

@@ -5,7 +5,11 @@
 #include <clang-c/Index.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <thread>
 #include <unordered_map>
 
@@ -600,9 +604,88 @@ std::optional<SymbolInfo> ClangProject::symbolAt(const std::string& file, int li
     return info;
 }
 
+namespace {
+
+// On-disk cache of the declarations found in one file, keyed by content and compile flags.
+// Format: "D" (definition) or "d" (declaration), line, column, file ("=" for the file itself),
+// external flag, USR; tab separated, one per line. "#failed" marks files libclang can't parse.
+constexpr const char* kIndexCacheVersion = "cppreviewer-index-2";
+
+struct IndexEntry {
+    bool definition;
+    Location loc;
+    std::string usr;
+};
+
+std::string indexCachePath(uint64_t key)
+{
+    char name[24];
+    std::snprintf(name, sizeof name, "%016llx", static_cast<unsigned long long>(key));
+    return (fs::path(cacheDirectory()) / "symbols" / std::string(name, 2) / name).string();
+}
+
+bool readIndexCache(const std::string& path, const std::string& self, std::vector<IndexEntry>& out, bool& failed)
+{
+    std::ifstream in(path);
+    if (!in)
+        return false;
+    std::string line;
+    failed = false;
+    while (std::getline(in, line)) {
+        if (line == "#failed") {
+            failed = true;
+            continue;
+        }
+        std::vector<std::string> f;
+        size_t b = 0;
+        for (int k = 0; k < 5; ++k) {
+            auto e = line.find('\t', b);
+            if (e == std::string::npos)
+                return false;
+            f.push_back(line.substr(b, e - b));
+            b = e + 1;
+        }
+        IndexEntry entry;
+        entry.definition = f[0] == "D";
+        entry.loc.line = std::atoi(f[1].c_str());
+        entry.loc.col = std::atoi(f[2].c_str());
+        entry.loc.file = f[3] == "=" ? self : f[3];
+        entry.loc.external = f[4] == "1";
+        entry.usr = line.substr(b);
+        out.push_back(std::move(entry));
+    }
+    return true;
+}
+
+void writeIndexCache(const std::string& path, const std::string& self, const std::vector<IndexEntry>& entries, bool failed)
+{
+    std::error_code ec;
+    fs::create_directories(fs::path(path).parent_path(), ec);
+    const auto tmp = path + ".tmp" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        if (failed)
+            out << "#failed\n";
+        for (const auto& e : entries)
+            out << (e.definition ? 'D' : 'd') << '\t' << e.loc.line << '\t' << e.loc.col << '\t'
+                << (e.loc.file == self ? "=" : e.loc.file) << '\t' << (e.loc.external ? '1' : '0') << '\t' << e.usr << '\n';
+        if (!out)
+            return;
+    }
+    fs::rename(tmp, path, ec);
+    if (ec)
+        fs::remove(tmp, ec);
+}
+
+} // namespace
+
 void ClangProject::buildIndex(const std::function<void(int, int)>& progress, const std::atomic<bool>& cancel)
 {
     auto files = listCppFiles(snap_);
+    // With a compile database, skip code it doesn't build (other components, other platforms):
+    // parsing it with borrowed flags is slow, useless, and it is what makes libclang crash.
+    if (db_ && !db_->empty())
+        std::erase_if(files, [&](const std::string& f) { return !db_->covers(projectRoot_, f); });
     const int total = static_cast<int>(files.size());
     std::atomic<int> next{0}, done{0};
     std::mutex progressMutex;
@@ -614,10 +697,30 @@ void ClangProject::buildIndex(const std::function<void(int, int)>& progress, con
             int i = next++;
             if (i >= total)
                 return;
-            const auto abs = absPath(files[static_cast<size_t>(i)]);
-            auto t = acquireTu(abs, true);
+            const auto& rel = files[static_cast<size_t>(i)];
+            const auto abs = absPath(rel);
+            // Cache key: content and flags, with this snapshot's location taken out so the same
+            // file in another revision hits the same entry.
+            std::string content;
+            {
+                std::ifstream in(abs, std::ios::binary);
+                content.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            uint64_t key = hashCombine(hashString(kIndexCacheVersion), hashString(content));
+            for (const auto& a : argsFor(abs)) {
+                std::string norm = a;
+                if (auto p = norm.find(snap_.root); p != std::string::npos)
+                    norm.replace(p, snap_.root.size(), "$SNAPSHOT");
+                key = hashCombine(key, hashString(norm));
+            }
+            const auto cachePath = indexCachePath(key);
+            std::vector<IndexEntry> entries;
+            bool failed = false;
+            const bool cached = readIndexCache(cachePath, rel, entries, failed);
+            std::shared_ptr<Tu> t = cached ? nullptr : acquireTu(abs, true);
+            if (!cached && !t)
+                failed = true;
             if (t) {
-                std::unordered_map<std::string, std::vector<Location>> localDefs, localDecls;
                 CXFile mainFile = clang_getFile(t->tu, abs.c_str());
                 visitChildren(clang_getTranslationUnitCursor(t->tu), [&](CXCursor c, CXCursor) {
                     if (!inFile(c, mainFile))
@@ -631,16 +734,35 @@ void ClangProject::buildIndex(const std::function<void(int, int)>& progress, con
                     std::string fileName;
                     int l = 0, cl = 0;
                     if (!usr.empty() && cursorFileLocation(c, fileName, l, cl)) {
-                        auto loc = toLocation(fileName, l, cl);
-                        (clang_isCursorDefinition(c) ? localDefs : localDecls)[usr].push_back(loc);
+                        bool definition = clang_isCursorDefinition(c) != 0;
+                        // With skipped function bodies libclang doesn't call functions definitions and
+                        // their extent stops before the body: look for "{", ": init" or "try" after it.
+                        if (!definition && isFunctionKind(k)) {
+                            CXFile f = nullptr;
+                            unsigned end = 0;
+                            clang_getSpellingLocation(clang_getRangeEnd(clang_getCursorExtent(c)), &f, nullptr, nullptr, &end);
+                            if (f && clang_File_isEqual(f, mainFile)) {
+                                size_t p = end;
+                                while (p < content.size() && std::isspace(static_cast<unsigned char>(content[p])))
+                                    ++p;
+                                definition = p < content.size() &&
+                                             (content[p] == '{' || content[p] == ':' || content.compare(p, 3, "try") == 0);
+                            }
+                        }
+                        entries.push_back({definition, toLocation(fileName, l, cl), usr});
                     }
                     return CXChildVisit_Recurse;
                 });
+            }
+            if (!cached && !cancel)
+                writeIndexCache(cachePath, rel, entries, failed);
+            if (cached)
+                ++cacheHits_;
+            ++indexedFiles_;
+            if (!entries.empty()) {
                 std::lock_guard lock(indexMutex_);
-                for (auto& [usr, locs] : localDefs)
-                    defs_[usr].insert(defs_[usr].end(), locs.begin(), locs.end());
-                for (auto& [usr, locs] : localDecls)
-                    decls_[usr].insert(decls_[usr].end(), locs.begin(), locs.end());
+                for (auto& e : entries)
+                    (e.definition ? defs_ : decls_)[e.usr].push_back(std::move(e.loc));
             }
             int d = ++done;
             if (progress) {

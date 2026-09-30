@@ -44,6 +44,57 @@ constexpr int kBadgeWidth = 18;
 
 } // namespace
 
+CodeView::BookmarkProvider CodeView::bookmarks_;
+
+void CodeView::setBookmarkProvider(BookmarkProvider p)
+{
+    bookmarks_ = std::move(p);
+}
+
+std::optional<QString> CodeView::bookmarkAt(int row) const
+{
+    if (!bookmarks_ || path_.isEmpty() || row < 0 || row >= rows_.size() || rows_[row].line < 0)
+        return std::nullopt;
+    return bookmarks_(side_, path_, rows_[row].line);
+}
+
+void CodeView::setSearch(const QString& text, QTextDocument::FindFlags flags)
+{
+    search_ = text;
+    searchFlags_ = flags;
+    updateExtraSelections();
+}
+
+bool CodeView::findNext(bool backward)
+{
+    if (search_.isEmpty())
+        return false;
+    auto flags = searchFlags_;
+    if (backward)
+        flags |= QTextDocument::FindBackward;
+    auto isCode = [this](const QTextCursor& c) {
+        const int row = c.blockNumber();
+        return row >= 0 && row < rows_.size() && rows_[row].line >= 0;
+    };
+    QTextCursor from = textCursor();
+    if (backward) // don't find the current match again
+        from.setPosition(from.selectionStart());
+    for (int pass = 0; pass < 2; ++pass) {
+        for (QTextCursor c = document()->find(search_, from, flags); !c.isNull(); c = document()->find(search_, c, flags)) {
+            if (!isCode(c))
+                continue;
+            setTextCursor(c);
+            centerCursor();
+            return true;
+        }
+        // Wrap around.
+        from = QTextCursor(document());
+        if (backward)
+            from.movePosition(QTextCursor::End);
+    }
+    return false;
+}
+
 CodeView::CodeView(QWidget* parent) : QPlainTextEdit(parent)
 {
     setReadOnly(true);
@@ -65,6 +116,8 @@ CodeView::CodeView(QWidget* parent) : QPlainTextEdit(parent)
             out.push_back({start, len, color});
         return out;
     });
+
+    highlighter_->setPlainProvider([this](int block) { return block >= 0 && block < rows_.size() && rows_[block].fold; });
 
     connect(this, &QPlainTextEdit::blockCountChanged, this, &CodeView::updateGutterWidth);
     connect(this, &QPlainTextEdit::updateRequest, this, &CodeView::updateGutter);
@@ -116,6 +169,12 @@ void CodeView::refreshTheme()
     viewport()->update();
 }
 
+void CodeView::refreshMarks()
+{
+    gutter_->update();
+    viewport()->update();
+}
+
 // Row backgrounds live in the block format so they survive re-highlighting.
 void CodeView::applyRowFormats()
 {
@@ -127,7 +186,9 @@ void CodeView::applyRowFormats()
         const auto& row = rows_[r];
         QColor bg;
         Qt::BrushStyle style = Qt::SolidPattern;
-        if (row.line < 0) {
+        if (row.fold) {
+            bg = theme.filler();
+        } else if (row.line < 0) {
             bg = theme.filler();
             style = Qt::BDiagPattern;
         } else {
@@ -252,7 +313,23 @@ void CodeView::lineNumberAreaPaint(QPaintEvent* e)
                     p.fillRect(QRect(0, top, w - kBadgeWidth, bottom - top), bg.darker(r.tag == cr::LineTag::None ? 100 : 108));
                 p.setPen(palette().color(QPalette::PlaceholderText));
                 p.setFont(font());
-                p.drawText(0, top, w - kBadgeWidth - 4, h, Qt::AlignRight | Qt::AlignVCenter, QString::number(r.line + 1));
+                if (const int shown = r.display >= 0 ? r.display : r.line + 1; shown > 0)
+                    p.drawText(0, top, w - kBadgeWidth - 4, h, Qt::AlignRight | Qt::AlignVCenter, QString::number(shown));
+            }
+            if (auto mark = bookmarkAt(row)) {
+                const QColor c = palette().color(QPalette::Link);
+                p.setPen(Qt::NoPen);
+                p.setBrush(c);
+                const int d = std::min(7, bottom - top - 4);
+                p.drawEllipse(QRect(1, top + (bottom - top - d) / 2, d, d));
+                if (!mark->isEmpty()) // has a comment: also a bar at the edge
+                    p.fillRect(QRect(0, top, 1, bottom - top), c);
+                p.setBrush(Qt::NoBrush);
+            }
+            if (r.fold) {
+                p.setPen(theme.changeColor(cr::ChangeKind::Added));
+                p.setFont(badgeFont);
+                p.drawText(0, top, w - 4, h, Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("✓"));
             }
             // Badge on the first row of a run belonging to one semantic change.
             if (r.change >= 0 && changeMeta_) {
@@ -281,13 +358,25 @@ static int rowAtGutterPos(const CodeView* v, QPoint pos)
 void CodeView::gutterClicked(QPoint pos)
 {
     int row = rowAtGutterPos(this, pos);
-    if (row >= 0 && row < rows_.size() && rows_[row].change >= 0)
+    if (row >= 0 && row < rows_.size() && rows_[row].fold)
+        emit foldActivated(rows_[row].hunk);
+    else if (row >= 0 && row < rows_.size() && rows_[row].change >= 0)
         emit changeActivated(rows_[row].change);
 }
 
 bool CodeView::gutterToolTip(QPoint pos, QString& text) const
 {
     int row = rowAtGutterPos(this, pos);
+    if (row >= 0 && row < rows_.size() && rows_[row].fold) {
+        text = tr("Reviewed hunk (click to show)");
+        return true;
+    }
+    if (auto mark = bookmarkAt(row)) {
+        text = mark->isEmpty() ? tr("Bookmark") : tr("Comment:\n%1").arg(*mark);
+        if (rows_[row].change >= 0 && changeMeta_)
+            text += QStringLiteral("\n\n") + changeMeta_(rows_[row].change).title;
+        return true;
+    }
     if (row < 0 || row >= rows_.size() || rows_[row].change < 0 || !changeMeta_)
         return false;
     text = changeMeta_(rows_[row].change).title + QStringLiteral("\n(click to open)");
@@ -346,6 +435,27 @@ void CodeView::updateExtraSelections()
             c = document()->find(highlightWord_, c, flags);
             if (c.isNull())
                 break;
+            QTextEdit::ExtraSelection s;
+            s.format = fmt;
+            s.cursor = c;
+            sels.push_back(s);
+        }
+    }
+    searchMatches_ = 0;
+    if (!search_.isEmpty()) {
+        QTextCharFormat fmt;
+        QColor bg = Theme::current().flash();
+        bg.setAlpha(Theme::current().dark ? 170 : 200);
+        fmt.setBackground(bg);
+        QTextCursor c(document());
+        for (int n = 0; n < 5000; ++n) {
+            c = document()->find(search_, c, searchFlags_);
+            if (c.isNull())
+                break;
+            const int row = c.blockNumber();
+            if (row < 0 || row >= rows_.size() || rows_[row].line < 0)
+                continue;
+            ++searchMatches_;
             QTextEdit::ExtraSelection s;
             s.format = fmt;
             s.cursor = c;
@@ -413,6 +523,50 @@ void CodeView::mouseReleaseEvent(QMouseEvent* e)
     QPlainTextEdit::mouseReleaseEvent(e);
 }
 
+// Comments of bookmarked lines are drawn after the end of the line.
+void CodeView::paintEvent(QPaintEvent* e)
+{
+    QPlainTextEdit::paintEvent(e);
+    if (!bookmarks_ || path_.isEmpty())
+        return;
+    QPainter p(viewport());
+    QFont f = font();
+    f.setItalic(true);
+    p.setFont(f);
+    QColor fg = palette().color(QPalette::Link);
+    QColor bg = fg;
+    bg.setAlpha(40);
+    const QFontMetrics fm(f);
+    for (QTextBlock b = firstVisibleBlock(); b.isValid(); b = b.next()) {
+        const QRectF geo = blockBoundingGeometry(b).translated(contentOffset());
+        if (geo.top() > e->rect().bottom())
+            break;
+        auto mark = bookmarkAt(b.blockNumber());
+        if (!mark || mark->isEmpty())
+            continue;
+        QTextCursor end(b);
+        end.movePosition(QTextCursor::EndOfBlock);
+        const int x = cursorRect(end).right() + fm.horizontalAdvance(QStringLiteral("    "));
+        const QString text = QStringLiteral("💬 ") + mark->section(QLatin1Char('\n'), 0, 0) +
+                             (mark->contains(QLatin1Char('\n')) ? QStringLiteral(" …") : QString());
+        QRect r(x, static_cast<int>(geo.top()), fm.horizontalAdvance(text) + 12, static_cast<int>(geo.height()));
+        p.fillRect(r, bg);
+        p.setPen(fg);
+        p.drawText(r.adjusted(6, 0, 0, 0), Qt::AlignLeft | Qt::AlignVCenter, text);
+    }
+}
+
+void CodeView::mouseDoubleClickEvent(QMouseEvent* e)
+{
+    const int row = cursorForPosition(e->pos()).blockNumber();
+    if (e->button() == Qt::LeftButton && row >= 0 && row < rows_.size() && rows_[row].fold) {
+        emit foldActivated(rows_[row].hunk);
+        e->accept();
+        return;
+    }
+    QPlainTextEdit::mouseDoubleClickEvent(e);
+}
+
 void CodeView::keyPressEvent(QKeyEvent* e)
 {
     if (e->key() == Qt::Key_F12) {
@@ -473,6 +627,31 @@ void CodeView::contextMenuEvent(QContextMenuEvent* e)
     def->setEnabled(onWord);
     decl->setEnabled(onWord);
     int row = cursorForPosition(e->pos()).blockNumber();
+    if (row >= 0 && row < rows_.size() && rows_[row].line >= 0 && !path_.isEmpty()) {
+        const int line = rows_[row].line;
+        const auto mark = bookmarkAt(row);
+        menu->addSeparator();
+        menu->addAction(mark ? tr("Remove Bookmark") : tr("Add Bookmark"), this,
+                        [this, line] { emit bookmarkRequested(this, line, BookmarkAction::Toggle); })
+            ->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_K));
+        menu->addAction(mark && !mark->isEmpty() ? tr("Edit Comment…") : tr("Add Comment…"), this,
+                        [this, line] { emit bookmarkRequested(this, line, BookmarkAction::EditComment); })
+            ->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_K));
+        if (openFileEnabled_)
+            menu->addAction(tr("Open Whole File in Tab"), this,
+                            [this, line] { emit openFileRequested(side_, path_, line); });
+    }
+    if (hunkReviewed_ && row >= 0 && row < rows_.size() && rows_[row].hunk >= 0) {
+        const int hunk = rows_[row].hunk;
+        menu->addSeparator();
+        if (rows_[row].fold)
+            menu->addAction(tr("Show Reviewed Hunk"), this, [this, hunk] { emit foldActivated(hunk); });
+        if (hunkReviewed_(hunk))
+            menu->addAction(tr("Unmark Hunk as Reviewed"), this, [this, hunk] { emit hunkReviewRequested(hunk, false); });
+        else
+            menu->addAction(tr("Mark Hunk as Reviewed"), this, [this, hunk] { emit hunkReviewRequested(hunk, true); })
+                ->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Return));
+    }
     if (row >= 0 && row < rows_.size() && rows_[row].change >= 0) {
         int change = rows_[row].change;
         menu->addAction(tr("Open Semantic Change"), this, [this, change] { emit changeActivated(change); });

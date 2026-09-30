@@ -1,6 +1,10 @@
 #include "MainWindow.hpp"
 
+#include "CompareDialog.hpp"
 #include "DiffView.hpp"
+#include "FileSearch.hpp"
+#include "FindBar.hpp"
+#include "QuickOpen.hpp"
 #include "RevisionDialog.hpp"
 #include "Theme.hpp"
 #include "core/Diff.hpp"
@@ -10,6 +14,9 @@
 #include <QStyle>
 #include <QStyleFactory>
 #include <QCheckBox>
+#include <QClipboard>
+#include <QComboBox>
+#include <QInputDialog>
 #include <QCloseEvent>
 #include <QDockWidget>
 #include <QFileDialog>
@@ -29,6 +36,7 @@
 #include <QProgressBar>
 #include <QScrollBar>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QStatusBar>
 #include <QTabBar>
 #include <QTabWidget>
@@ -57,6 +65,7 @@ QString esc(const QString& s)
 constexpr int RoleChange = Qt::UserRole + 1;
 constexpr int RoleFile = Qt::UserRole + 2;
 constexpr int RoleOccurrence = Qt::UserRole + 3;
+constexpr int RoleLabel = Qt::UserRole + 4; // text of an item before review progress is added
 
 
 // Order in which change groups are listed: refactorings first, plain edits last.
@@ -109,7 +118,17 @@ MainWindow::MainWindow()
     buildMenus();
     QSettings settings;
     restoreGeometry(settings.value(QStringLiteral("geometry")).toByteArray());
+    // Layouts saved before the Search and Bookmarks docks existed leave them stacked under the
+    // other docks; tab them with the semantic changes once.
+    constexpr int kLayoutVersion = 2;
     restoreState(settings.value(QStringLiteral("windowState")).toByteArray());
+    if (settings.value(QStringLiteral("layoutVersion"), 1).toInt() < kLayoutVersion) {
+        auto* changesDock = findChild<QDockWidget*>(QStringLiteral("changesDock"));
+        for (auto* dock : {searchDock_, bookmarksDock_})
+            tabifyDockWidget(changesDock, dock);
+        changesDock->raise();
+        settings.setValue(QStringLiteral("layoutVersion"), kLayoutVersion);
+    }
     updateRevisionButtons();
 }
 
@@ -122,6 +141,7 @@ MainWindow::~MainWindow()
 
 void MainWindow::closeEvent(QCloseEvent* e)
 {
+    saveCurrentSession();
     QSettings settings;
     settings.setValue(QStringLiteral("geometry"), saveGeometry());
     settings.setValue(QStringLiteral("windowState"), saveState());
@@ -137,11 +157,7 @@ void MainWindow::buildUi()
     tb->setToolButtonStyle(Qt::ToolButtonTextOnly);
     tb->setMovable(false);
 
-    tb->addAction(tr("Open…"), this, [this] {
-        auto dir = QFileDialog::getExistingDirectory(this, tr("Open Git Repository"));
-        if (!dir.isEmpty() && openRepository(dir))
-            startReview();
-    });
+    tb->addAction(tr("New…"), this, &MainWindow::newComparison)->setToolTip(tr("New comparison (Ctrl+N)"));
     tb->addSeparator();
     tb->addWidget(new QLabel(tr(" Base: ")));
     baseButton_ = new QToolButton;
@@ -175,6 +191,18 @@ void MainWindow::buildUi()
     presets->setMenu(pm);
     tb->addWidget(presets);
 
+    // Comparing two pull requests: their patches, or the files after each.
+    auto* prView = new QActionGroup(this);
+    interdiffAction_ = tb->addAction(tr("Interdiff"), this, [this] { setPrView(false); });
+    interdiffAction_->setToolTip(tr("The two pull requests' changes side by side: differences mean they don't do the same"));
+    finalFilesAction_ = tb->addAction(tr("Final Files"), this, [this] { setPrView(true); });
+    finalFilesAction_->setToolTip(tr("The files after each pull request, with semantic analysis and navigation"));
+    for (auto* a : {interdiffAction_, finalFilesAction_}) {
+        a->setCheckable(true);
+        a->setVisible(false);
+        prView->addAction(a);
+    }
+
     tb->addSeparator();
     backAction_ = tb->addAction(QStringLiteral("◀"), this, &MainWindow::goBack);
     backAction_->setToolTip(tr("Navigate back (Alt+Left)"));
@@ -207,10 +235,38 @@ void MainWindow::buildUi()
         backAction_->setEnabled(!back_.isEmpty());
         forwardAction_->setEnabled(!forward_.isEmpty());
     });
-    setCentralWidget(tabs_);
+    auto* central = new QWidget;
+    auto* centralLayout = new QVBoxLayout(central);
+    centralLayout->setContentsMargins(0, 0, 0, 0);
+    centralLayout->setSpacing(0);
+    centralLayout->addWidget(tabs_, 1);
+    findBar_ = new FindBar;
+    centralLayout->addWidget(findBar_);
+    setCentralWidget(central);
+    connect(findBar_, &FindBar::searchChanged, this, &MainWindow::applySearch);
+    connect(findBar_, &FindBar::findRequested, this, &MainWindow::findInView);
+    connect(findBar_, &FindBar::closed, this, &MainWindow::closeFindBar);
+    connect(tabs_, &QTabWidget::currentChanged, this, [this] {
+        if (findBar_->isVisible())
+            applySearch();
+    });
+    connect(qApp, &QApplication::focusChanged, this, [this](QWidget*, QWidget* now) {
+        if (auto* v = qobject_cast<CodeView*>(now))
+            lastCodeView_ = v;
+    });
+    CodeView::setBookmarkProvider([this](cr::Side side, const QString& path, int line) {
+        return bookmarks_.commentAt(QFileInfo(path).isAbsolute() ? cr::Side::New : side, path, line);
+    });
     connect(diff_, &DiffView::definitionRequested, this, &MainWindow::onDefinitionRequested);
     connect(diff_, &DiffView::hoverRequested, this, &MainWindow::onHoverRequested);
     connect(diff_, &DiffView::changeActivated, this, &MainWindow::openChangeComparison);
+    connect(diff_, &DiffView::bookmarkRequested, this, &MainWindow::onBookmarkRequested);
+    connect(diff_, &DiffView::openFileRequested, this, &MainWindow::openWholeFile);
+    diff_->setReviewedProvider([this](const cr::Hunk& h) { return hunkReviewed(currentFile_, h); });
+    connect(diff_, &DiffView::hunkReviewToggled, this, [this](quint64 key, bool on) {
+        reviewed_.set(key, on);
+        refreshReviewMarks();
+    });
 
     // Files dock.
     files_ = new QTreeWidget;
@@ -251,16 +307,22 @@ void MainWindow::buildUi()
     changeFilter_->setClearButtonEnabled(true);
     hideTrivial_ = new QCheckBox(tr("Hide rename-only"));
     hideTrivial_->setToolTip(tr("Hide modifications that consist only of identifier renames"));
+    hideReviewed_ = new QCheckBox(tr("Hide reviewed"));
+    hideReviewed_->setToolTip(tr("Hide changes you have checked as reviewed"));
     filterRow->addWidget(changeFilter_, 1);
     filterRow->addWidget(hideTrivial_);
+    filterRow->addWidget(hideReviewed_);
     cl->addLayout(filterRow);
     changes_ = new QTreeWidget;
     changes_->setHeaderHidden(true);
+    updateChangesIndentation();
     changes_->setUniformRowHeights(true);
     changes_->setToolTip(tr("Click to show, double-click to compare with the original code"));
     cl->addWidget(changes_, 1);
     connect(changeFilter_, &QLineEdit::textChanged, this, &MainWindow::filterChanges);
     connect(hideTrivial_, &QCheckBox::toggled, this, &MainWindow::filterChanges);
+    connect(hideReviewed_, &QCheckBox::toggled, this, &MainWindow::filterChanges);
+    connect(changes_, &QTreeWidget::itemChanged, this, &MainWindow::onChangeItemChanged);
     connect(changes_, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem* it) {
         bool ok = false;
         int c = it->data(0, RoleChange).toInt(&ok);
@@ -300,6 +362,99 @@ void MainWindow::buildUi()
     addDockWidget(Qt::LeftDockWidgetArea, changesDock);
     splitDockWidget(filesDock, changesDock, Qt::Vertical);
 
+    // Search in files dock.
+    auto* searchWidget = new QWidget;
+    auto* sl = new QVBoxLayout(searchWidget);
+    sl->setContentsMargins(0, 0, 0, 0);
+    sl->setSpacing(2);
+    auto* searchRow = new QHBoxLayout;
+    searchEdit_ = new QLineEdit;
+    searchEdit_->setPlaceholderText(tr("Search in files… (Enter)"));
+    searchEdit_->setClearButtonEnabled(true);
+    searchScope_ = new QComboBox;
+    searchScope_->addItems({tr("Changed files"), tr("Whole target"), tr("Whole base")});
+    searchScope_->setToolTip(tr("Changed files: their target version (deleted files: their base version)"));
+    searchRow->addWidget(searchEdit_, 1);
+    searchRow->addWidget(searchScope_);
+    sl->addLayout(searchRow);
+    auto* optRow = new QHBoxLayout;
+    searchCase_ = new QCheckBox(tr("Case"));
+    searchWord_ = new QCheckBox(tr("Word"));
+    searchRegex_ = new QCheckBox(tr("Regex"));
+    searchInfo_ = new QLabel;
+    optRow->addWidget(searchCase_);
+    optRow->addWidget(searchWord_);
+    optRow->addWidget(searchRegex_);
+    optRow->addWidget(searchInfo_, 1);
+    sl->addLayout(optRow);
+    searchResults_ = new QTreeWidget;
+    searchResults_->setHeaderHidden(true);
+    searchResults_->setUniformRowHeights(true);
+    sl->addWidget(searchResults_, 1);
+    connect(searchEdit_, &QLineEdit::returnPressed, this, &MainWindow::startFileSearch);
+    connect(searchResults_, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem* it) {
+        const int line = it->data(0, RoleOccurrence).toInt();
+        if (line <= 0)
+            return;
+        cr::Location loc;
+        loc.file = it->data(0, RoleFile).toString().toStdString();
+        loc.line = line;
+        navigateTo(static_cast<cr::Side>(it->data(0, RoleChange).toInt()), loc);
+    });
+    connect(searchResults_, &QTreeWidget::itemClicked, searchResults_, &QTreeWidget::itemActivated);
+    searchDock_ = new QDockWidget(tr("Search"), this);
+    searchDock_->setObjectName(QStringLiteral("searchDock"));
+    searchDock_->setWidget(searchWidget);
+    addDockWidget(Qt::LeftDockWidgetArea, searchDock_);
+    tabifyDockWidget(changesDock, searchDock_);
+
+    // Bookmarks dock.
+    auto* bookmarksWidget = new QWidget;
+    auto* bl = new QVBoxLayout(bookmarksWidget);
+    bl->setContentsMargins(0, 0, 0, 0);
+    bl->setSpacing(2);
+    bookmarkList_ = new QTreeWidget;
+    bookmarkList_->setHeaderLabels({tr("Location"), tr("Comment"), tr("Code")});
+    bookmarkList_->setRootIsDecorated(false);
+    bookmarkList_->setUniformRowHeights(true);
+    bookmarkList_->setContextMenuPolicy(Qt::CustomContextMenu);
+    bookmarkList_->setToolTip(tr("Ctrl+K: bookmark the current line · Ctrl+Shift+K: comment · F2 / Shift+F2: next / previous"));
+    bl->addWidget(bookmarkList_, 1);
+    auto* bookmarkButtons = new QHBoxLayout;
+    auto* copyMd = new QToolButton;
+    copyMd->setText(tr("Copy as Markdown"));
+    copyMd->setToolTip(tr("Copy every bookmark with its code line and comment, e.g. for a PR review"));
+    bookmarkButtons->addWidget(copyMd);
+    bookmarkButtons->addStretch(1);
+    bl->addLayout(bookmarkButtons);
+    connect(copyMd, &QToolButton::clicked, this, [this] {
+        QApplication::clipboard()->setText(bookmarks_.toMarkdown());
+        statusLabel_->setText(tr("Copied %n bookmark(s) as Markdown", nullptr, static_cast<int>(bookmarks_.items().size())));
+    });
+    connect(bookmarkList_, &QTreeWidget::itemActivated, this,
+            [this](QTreeWidgetItem* it) { gotoBookmark(it->data(0, RoleOccurrence).toInt()); });
+    connect(bookmarkList_, &QTreeWidget::itemClicked, bookmarkList_, &QTreeWidget::itemActivated);
+    connect(bookmarkList_, &QTreeWidget::customContextMenuRequested, this, [this](QPoint pos) {
+        auto* it = bookmarkList_->itemAt(pos);
+        if (!it)
+            return;
+        const int index = it->data(0, RoleOccurrence).toInt();
+        QMenu menu;
+        menu.addAction(tr("Go to Bookmark"), this, [this, index] { gotoBookmark(index); });
+        menu.addAction(tr("Edit Comment…"), this, [this, index] { editBookmarkComment(index); });
+        menu.addAction(tr("Remove Bookmark"), this, [this, index] {
+            bookmarks_.remove(index);
+            populateBookmarks();
+        });
+        menu.exec(bookmarkList_->viewport()->mapToGlobal(pos));
+    });
+    bookmarksDock_ = new QDockWidget(tr("Bookmarks"), this);
+    bookmarksDock_->setObjectName(QStringLiteral("bookmarksDock"));
+    bookmarksDock_->setWidget(bookmarksWidget);
+    addDockWidget(Qt::LeftDockWidgetArea, bookmarksDock_);
+    tabifyDockWidget(changesDock, bookmarksDock_);
+    changesDock->raise();
+
     statusLabel_ = new QLabel;
     progress_ = new QProgressBar;
     progress_->setMaximumWidth(220);
@@ -313,6 +468,7 @@ void MainWindow::buildUi()
 void MainWindow::buildMenus()
 {
     auto* file = menuBar()->addMenu(tr("&File"));
+    file->addAction(tr("&New Comparison…"), QKeySequence::New, this, &MainWindow::newComparison);
     file->addAction(tr("&Open Repository…"), QKeySequence::Open, this, [this] {
         auto dir = QFileDialog::getExistingDirectory(this, tr("Open Git Repository"));
         if (!dir.isEmpty() && openRepository(dir))
@@ -350,6 +506,50 @@ void MainWindow::buildMenus()
     semantic_->setChecked(true);
     connect(semantic_, &QAction::toggled, this, &MainWindow::startReview);
     review->addAction(tr("Set &compile_commands.json…"), this, &MainWindow::chooseCompileDatabase);
+    review->addSeparator();
+    review->addAction(tr("&Mark Hunk as Reviewed, Go to Next"), QKeySequence(Qt::CTRL | Qt::Key_Return), this, [this] {
+        if (tabs_->currentWidget() == diff_ && !diff_->markHunkAtCursorReviewed())
+            statusLabel_->setText(tr("No unreviewed hunk at or below the cursor"));
+    });
+    auto* showReviewed = review->addAction(tr("Show Re&viewed Hunks"));
+    showReviewed->setCheckable(true);
+    showReviewed->setToolTip(tr("Show hunks marked as reviewed instead of folding them"));
+    connect(showReviewed, &QAction::toggled, this, [this](bool on) { diff_->setFoldingEnabled(!on); });
+
+    auto* edit = menuBar()->addMenu(tr("&Search"));
+    edit->addAction(tr("&Find…"), QKeySequence::Find, this, [this] {
+        auto* v = activeCodeView();
+        findBar_->activate(v ? v->textCursor().selectedText() : QString());
+    });
+    edit->addAction(tr("Find &Next"), QKeySequence(Qt::Key_F3), this, [this] { findInView(false); });
+    edit->addAction(tr("Find &Previous"), QKeySequence(Qt::SHIFT | Qt::Key_F3), this, [this] { findInView(true); });
+    edit->addAction(tr("Find in &Files…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F), this, [this] {
+        searchDock_->show();
+        searchDock_->raise();
+        if (auto* v = activeCodeView(); v && v->textCursor().hasSelection())
+            searchEdit_->setText(v->textCursor().selectedText());
+        searchEdit_->setFocus();
+        searchEdit_->selectAll();
+    });
+    edit->addSeparator();
+    edit->addAction(tr("&Open File…"), QKeySequence(Qt::CTRL | Qt::Key_P), this, &MainWindow::openQuickOpen);
+
+    auto* marks = menuBar()->addMenu(tr("&Bookmarks"));
+    marks->addAction(tr("&Toggle Bookmark"), QKeySequence(Qt::CTRL | Qt::Key_K), this,
+                     [this] { bookmarkAtCursor(BookmarkAction::Toggle); });
+    marks->addAction(tr("Add/Edit &Comment…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_K), this,
+                     [this] { bookmarkAtCursor(BookmarkAction::EditComment); });
+    marks->addAction(tr("&Next Bookmark"), QKeySequence(Qt::Key_F2), this, [this] { stepBookmark(true); });
+    marks->addAction(tr("&Previous Bookmark"), QKeySequence(Qt::SHIFT | Qt::Key_F2), this, [this] { stepBookmark(false); });
+    marks->addSeparator();
+    marks->addAction(tr("Show &Bookmarks"), this, [this] {
+        bookmarksDock_->show();
+        bookmarksDock_->raise();
+    });
+    marks->addAction(tr("Copy All as &Markdown"), this, [this] {
+        QApplication::clipboard()->setText(bookmarks_.toMarkdown());
+        statusLabel_->setText(tr("Copied %n bookmark(s) as Markdown", nullptr, static_cast<int>(bookmarks_.items().size())));
+    });
 
     auto* nav = menuBar()->addMenu(tr("&Navigate"));
     nav->addAction(backAction_);
@@ -400,7 +600,10 @@ void MainWindow::buildMenus()
         connect(a, &QAction::triggered, this, [this, mode] { setTheme(mode); });
     }
     view->addSeparator();
-    view->addAction(tr("&Clear Highlights"), QKeySequence(Qt::Key_Escape), this, [this] { setWordHighlight({}, {}); });
+    view->addAction(tr("&Clear Highlights"), QKeySequence(Qt::Key_Escape), this, [this] {
+        setWordHighlight({}, {});
+        closeFindBar();
+    });
     view->addAction(tr("Zoom &In"), QKeySequence::ZoomIn, this, [zoom] { zoom(1); });
     view->addAction(tr("Zoom &Out"), QKeySequence::ZoomOut, this, [zoom] { zoom(-1); });
 
@@ -462,10 +665,19 @@ void MainWindow::applyAppTheme(const QString& mode)
     Theme::syncWithPalette();
 }
 
+// Changes have a checkbox before their text; without extra indentation their related places
+// (hunks, calls...) would start at the same column and look like more changes.
+void MainWindow::updateChangesIndentation()
+{
+    static const int base = changes_->indentation();
+    changes_->setIndentation(base + changes_->style()->pixelMetric(QStyle::PM_IndicatorWidth) + 6);
+}
+
 void MainWindow::setTheme(const QString& mode)
 {
     QSettings().setValue(QStringLiteral("theme"), mode);
     applyAppTheme(mode);
+    updateChangesIndentation(); // the style may have changed
     for (auto* v : findChildren<CodeView*>())
         v->refreshTheme();
     if (state_ && state_->result) {
@@ -509,8 +721,45 @@ bool MainWindow::openRepository(const QString& path)
     return true;
 }
 
+bool MainWindow::newComparison()
+{
+    QString repo = repo_ ? q(repo_->root()) : QString();
+    if (repo.isEmpty())
+        repo = cr::GitRepo::open(QDir::currentPath().toStdString()) ? QDir::currentPath()
+                                                                    : QSettings().value(QStringLiteral("lastRepository")).toString();
+    CompareDialog dlg(repo, isVisible() ? this : nullptr);
+    if (dlg.exec() != QDialog::Accepted)
+        return false;
+    saveCurrentSession();
+    const auto c = dlg.choice();
+    switch (c.kind) {
+    case CompareChoice::Kind::Resume:
+        resumeSession(c.session, c.latest);
+        break;
+    case CompareChoice::Kind::Directories:
+        compareDirectories(c.oldDir, c.newDir);
+        break;
+    case CompareChoice::Kind::PullRequest:
+        if (openRepository(c.repo))
+            reviewPullRequest(c.pr);
+        break;
+    case CompareChoice::Kind::Revisions:
+        if (openRepository(c.repo))
+            setRevisions(c.base, c.target);
+        break;
+    case CompareChoice::Kind::PullRequests:
+        if (!c.repo.isEmpty())
+            openRepository(c.repo); // where to fetch a pull request of this repository
+        comparePullRequests(c.linkA, c.linkB, c.mapping);
+        break;
+    }
+    return true;
+}
+
 void MainWindow::setRevisions(cr::Revision base, cr::Revision target, bool start)
 {
+    prRequest_.reset();
+    currentPrLink_.clear();
     base_ = std::move(base);
     target_ = std::move(target);
     haveRevisions_ = true;
@@ -615,45 +864,35 @@ void MainWindow::reviewPullRequest(const PullRequestChoice& pr)
 {
     if (!repo_)
         return;
-    struct Fetched {
-        QString error;
-        std::string head, base;
-    };
-    showProgress(tr("Fetching pull request #%1 from %2…").arg(pr.number).arg(pr.remote), 0, 0);
+    const QString source = pr.slug.isEmpty() ? pr.remote : pr.slug;
+    showProgress(tr("Fetching pull request #%1 from %2…").arg(pr.number).arg(source), 0, 0);
     auto repo = *repo_;
+    using Fetched = cr::GitRepo::FetchedPullRequest;
     auto* watcher = new QFutureWatcher<Fetched>(this);
     connect(watcher, &QFutureWatcher<Fetched>::finished, this, [this, watcher, pr] {
         watcher->deleteLater();
         auto f = watcher->result();
-        if (!f.error.isEmpty()) {
+        if (!f.error.empty()) {
             finishProgress(tr("Fetching the pull request failed"));
-            QMessageBox::warning(this, tr("Pull Request"), f.error);
+            QMessageBox::warning(this, tr("Pull Request"), q(f.error));
             return;
         }
         auto title = QStringLiteral("PR #%1").arg(pr.number);
-        if (!pr.title.isEmpty())
-            title += QStringLiteral(": ") + pr.title.left(40);
-        setRevisions(cr::Revision::commit(f.base, f.base, ("merge-base with " + pr.remote + "/" + pr.baseRef).toStdString()),
-                     cr::Revision::commit(f.head, f.head, title.toStdString()));
+        const QString prTitle = pr.title.isEmpty() ? q(f.title) : pr.title;
+        if (!prTitle.isEmpty())
+            title += QStringLiteral(": ") + prTitle.left(40);
+        setRevisions(cr::Revision::commit(f.base, f.base, f.baseLabel), cr::Revision::commit(f.head, f.head, title.toStdString()));
+        // Remember the link, so the session can fetch the pull request again later.
+        std::string host = pr.host.toStdString(), slug = pr.slug.toStdString();
+        if (slug.empty() && repo_)
+            cr::hostAndSlugFromUrl(pr.remote.contains(QStringLiteral("://")) ? pr.remote.toStdString()
+                                                                             : repo_->remoteUrl(pr.remote.toStdString()),
+                                   host, slug);
+        if (!slug.empty())
+            currentPrLink_ = QStringLiteral("https://%1/%2/pull/%3").arg(q(host), q(slug)).arg(pr.number);
     });
     watcher->setFuture(QtConcurrent::run([repo, pr]() {
-        Fetched f;
-        std::string err;
-        const auto remote = pr.remote.toStdString();
-        f.head = repo.fetchPullRequest(remote, pr.number, &err);
-        if (f.head.empty()) {
-            f.error = tr("Could not fetch pull/%1/head from %2:\n%3").arg(pr.number).arg(pr.remote, q(err));
-            return f;
-        }
-        auto baseHead = repo.fetchBranch(remote, pr.baseRef.toStdString(), &err);
-        if (baseHead.empty()) {
-            f.error = tr("Could not fetch base branch %1:\n%2").arg(pr.baseRef, q(err));
-            return f;
-        }
-        f.base = repo.mergeBase(baseHead, f.head);
-        if (f.base.empty())
-            f.error = tr("No merge base between %1 and the pull request.").arg(pr.baseRef);
-        return f;
+        return repo.fetchPullRequestForReview(pr.remote.toStdString(), pr.number, pr.baseRef.toStdString());
     }));
 }
 
@@ -686,23 +925,30 @@ void MainWindow::finishProgress(const QString& message)
     statusLabel_->setText(message);
 }
 
-void MainWindow::startReview()
+std::shared_ptr<MainWindow::State> MainWindow::beginReview()
 {
-    if (!haveRevisions_)
-        return;
     if (state_)
         state_->cancel = true;
-
     auto st = std::make_shared<State>();
-    st->session = std::make_shared<cr::ReviewSession>(repo_, base_, target_);
-    if (!compileDbOverride_.isEmpty())
-        st->session->setCompileDatabasePath(compileDbOverride_.toStdString());
     state_ = st;
+    reviewed_ = cr::ReviewedStore(repo_ ? repo_->root() : target_.ref);
+    bookmarks_.load(repo_ ? repo_->root() : target_.ref);
     lineCache_.clear();
     back_.clear();
     forward_.clear();
     backAction_->setEnabled(false);
     forwardAction_->setEnabled(false);
+    clearResultView();
+    diff_->showDiff(cr::FileDiff{}, tr("Computing review…"));
+    updateTitle();
+    return st;
+}
+
+void MainWindow::clearResultView()
+{
+    changeKeys_.clear();
+    reviewedChanges_.clear();
+    fileHunks_.clear();
     // Close navigation tabs: they belong to the previous revisions.
     for (int i = tabs_->count() - 1; i >= 0; --i) {
         if (tabs_->widget(i) != diff_) {
@@ -715,8 +961,75 @@ void MainWindow::startReview()
     changes_->clear();
     currentFile_ = -1;
     setWordHighlight({}, {});
-    diff_->showDiff(cr::FileDiff{}, tr("Computing review…"));
-    updateTitle();
+}
+
+void MainWindow::showResult(const std::shared_ptr<State>& st)
+{
+    clearResultView();
+    const auto dbPath = st->session ? q(st->session->compileDatabasePath()) : QString();
+    dbLabel_->setVisible(st->session != nullptr);
+    dbLabel_->setText(dbPath.isEmpty() ? tr("⚠ no compile_commands.json (fallback flags)")
+                                       : tr("compile_commands: %1").arg(QFileInfo(dbPath).dir().dirName() +
+                                                                          QStringLiteral("/") +
+                                                                          QFileInfo(dbPath).fileName()));
+    dbLabel_->setToolTip(dbPath.isEmpty()
+                             ? tr("Without a compilation database includes and macros may not resolve. "
+                                  "Configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON or set one in the Review menu.")
+                             : dbPath);
+    const bool interdiff = st->prs && st->result == st->prs->interdiff;
+    if (interdiff)
+        diff_->setSideCaptions(tr("Changes of %1").arg(q(st->prs->a.label)), tr("Changes of %1").arg(q(st->prs->b.label)));
+    else
+        diff_->setSideCaptions(tr("Base: %1").arg(q(base_.display())), tr("Target: %1").arg(q(target_.display())));
+    for (const auto& c : st->result->changes)
+        changeKeys_.push_back(cr::changeKey(*st->result, c));
+    for (const auto& f : st->result->files)
+        fileHunks_.push_back(cr::diffHunks(f));
+    if (st->session) {
+        bookmarks_.relocate([this](cr::Side side, const QString& path) { return fileLines(side, path); });
+        populateBookmarks();
+    }
+    populateFiles();
+    populateChanges();
+    int changes = 0;
+    for (const auto& c : st->result->changes)
+        changes += c.trivial ? 0 : 1;
+    if (interdiff) {
+        int same = 0;
+        for (const auto& f : st->result->files)
+            same += f.change.status == '=' ? 1 : 0;
+        finishProgress(tr("Interdiff: %1 of %n file(s) changed the same way", nullptr,
+                          static_cast<int>(st->result->files.size()))
+                           .arg(same));
+    } else {
+        finishProgress(tr("%n file(s) changed", nullptr, static_cast<int>(st->result->files.size())) +
+                       tr(", %n semantic change(s)", nullptr, changes));
+    }
+    if (files_->topLevelItemCount() > 0)
+        files_->setCurrentItem(files_->topLevelItem(0));
+    else
+        diff_->showDiff(cr::FileDiff{}, tr("No differences."));
+    updatePrViewActions();
+    if (st->session)
+        startIndexing(st);
+    if (pendingRestore_ && applyPendingRestore())
+        return; // another result comes first (the final files of resumed pull requests)
+    saveCurrentSession();
+    emit reviewFinished();
+}
+
+void MainWindow::startReview()
+{
+    if (prRequest_) {
+        startPullRequestComparison();
+        return;
+    }
+    if (!haveRevisions_)
+        return;
+    auto st = beginReview();
+    st->session = std::make_shared<cr::ReviewSession>(repo_, base_, target_);
+    if (!compileDbOverride_.isEmpty())
+        st->session->setCompileDatabasePath(compileDbOverride_.toStdString());
 
     cr::ReviewOptions options;
     options.ignoreWhitespace = ignoreWhitespace_->isChecked();
@@ -742,34 +1055,13 @@ void MainWindow::startReview()
             return; // superseded by a newer review
         auto out = watcher->result();
         if (!out.error.isEmpty() || !out.result) {
+            pendingRestore_.reset();
             finishProgress(tr("Review failed"));
             diff_->showDiff(cr::FileDiff{}, tr("<b>Review failed:</b> %1").arg(esc(out.error)));
             return;
         }
         st->result = out.result;
-        const auto dbPath = q(st->session->compileDatabasePath());
-        dbLabel_->setText(dbPath.isEmpty() ? tr("⚠ no compile_commands.json (fallback flags)")
-                                           : tr("compile_commands: %1").arg(QFileInfo(dbPath).dir().dirName() +
-                                                                              QStringLiteral("/") +
-                                                                              QFileInfo(dbPath).fileName()));
-        dbLabel_->setToolTip(dbPath.isEmpty()
-                                 ? tr("Without a compilation database includes and macros may not resolve. "
-                                      "Configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON or set one in the Review menu.")
-                                 : dbPath);
-        diff_->setSideCaptions(tr("Base: %1").arg(q(base_.display())), tr("Target: %1").arg(q(target_.display())));
-        populateFiles();
-        populateChanges();
-        int changes = 0;
-        for (const auto& c : st->result->changes)
-            changes += c.trivial ? 0 : 1;
-        finishProgress(tr("%n file(s) changed", nullptr, static_cast<int>(st->result->files.size())) +
-                       tr(", %n semantic change(s)", nullptr, changes));
-        if (files_->topLevelItemCount() > 0)
-            files_->setCurrentItem(files_->topLevelItem(0));
-        else
-            diff_->showDiff(cr::FileDiff{}, tr("No differences."));
-        startIndexing(st);
-        emit reviewFinished();
+        showResult(st);
     });
     watcher->setFuture(QtConcurrent::run([st, options, post]() {
         Outcome out;
@@ -783,10 +1075,309 @@ void MainWindow::startReview()
     }));
 }
 
+// ------------------------------------------------------------------------------------ two pull requests
+
+void MainWindow::comparePullRequests(const QString& linkA, const QString& linkB, const QString& mapping)
+{
+    prRequest_ = PrRequest{linkA, linkB, mapping, std::nullopt, std::nullopt};
+    startPullRequestComparison();
+}
+
+void MainWindow::startPullRequestComparison()
+{
+    if (!prRequest_)
+        return;
+    const auto req = *prRequest_;
+    auto st = beginReview();
+    showProgress(tr("Fetching the pull requests…"), 0, 0);
+    auto local = repo_;
+    const bool ignoreWs = ignoreWhitespace_->isChecked();
+
+    struct Outcome {
+        QString error;
+        std::shared_ptr<PrComparison> prs;
+    };
+    auto* watcher = new QFutureWatcher<Outcome>(this);
+    connect(watcher, &QFutureWatcher<Outcome>::finished, this, [this, watcher, st] {
+        watcher->deleteLater();
+        if (st != state_)
+            return;
+        auto out = watcher->result();
+        if (!out.error.isEmpty()) {
+            pendingRestore_.reset();
+            finishProgress(tr("Comparing the pull requests failed"));
+            diff_->showDiff(cr::FileDiff{}, tr("<b>Comparing the pull requests failed:</b> %1").arg(esc(out.error)));
+            return;
+        }
+        st->prs = out.prs;
+        const auto& a = st->prs->a;
+        const auto& b = st->prs->b;
+        base_ = cr::Revision::commit(a.label, a.head, a.label + (a.title.empty() ? "" : ": " + a.title));
+        target_ = cr::Revision::commit(b.label, b.head, b.label + (b.title.empty() ? "" : ": " + b.title));
+        haveRevisions_ = true;
+        updateRevisionButtons();
+        st->result = st->prs->interdiff;
+        showResult(st);
+        const auto m = st->prs->mapping;
+        statusLabel_->setText(statusLabel_->text() + tr("  ·  paths: %1")
+                                                         .arg(m.from.empty() && m.to.empty() ? tr("same in both")
+                                                                                               : q(m.from.empty() ? "(root)" : m.from) +
+                                                                                                     QStringLiteral(" → ") +
+                                                                                                     q(m.to.empty() ? "(root)" : m.to)));
+    });
+    watcher->setFuture(QtConcurrent::run([req, local, ignoreWs]() {
+        Outcome out;
+        auto prs = std::make_shared<PrComparison>();
+        for (int k = 0; k < 2; ++k) {
+            // A resumed session reopens the commits it had, if they're still there.
+            if (const auto& stored = k == 0 ? req.storedA : req.storedB; stored && !stored->head.isEmpty()) {
+                auto repo = stored->cached ? cr::GitRepo::openBare(stored->repo.toStdString())
+                                           : cr::GitRepo::open(stored->repo.toStdString());
+                if (repo)
+                    if (auto pr = cr::resolvePullRequest(*repo, stored->cached, stored->base.toStdString(),
+                                                         stored->head.toStdString(), stored->title.toStdString(),
+                                                         stored->label.toStdString())) {
+                        (k == 0 ? prs->a : prs->b) = std::move(*pr);
+                        continue;
+                    }
+            }
+            const auto link = (k == 0 ? req.linkA : req.linkB).toStdString();
+            auto url = cr::parsePullRequestUrl(link);
+            if (!url) {
+                out.error = tr("Not a pull request link: %1").arg(q(link));
+                return out;
+            }
+            std::string err;
+            auto pr = cr::resolvePullRequest(*url, local ? &*local : nullptr, &err);
+            if (!pr) {
+                out.error = q(err);
+                return out;
+            }
+            (k == 0 ? prs->a : prs->b) = std::move(*pr);
+        }
+        if (auto m = cr::PathMapping::parse(req.mapping.toStdString()))
+            prs->mapping = *m;
+        else
+            prs->mapping = cr::guessPathMapping(prs->a, prs->b);
+        prs->pairs = cr::pairFiles(prs->a, prs->b, prs->mapping);
+        prs->interdiff = std::make_shared<cr::ReviewResult>(cr::computeInterdiff(prs->a, prs->b, prs->pairs, ignoreWs));
+        out.prs = prs;
+        return out;
+    }));
+}
+
+std::optional<SessionRecord> MainWindow::currentSessionRecord() const
+{
+    if (!state_ || !state_->result)
+        return std::nullopt;
+    SessionRecord r;
+    if (prRequest_ && state_->prs) {
+        r.kind = SessionRecord::Kind::PullRequests;
+        r.linkA = prRequest_->linkA;
+        r.linkB = prRequest_->linkB;
+        r.mapping = prRequest_->mapping;
+        r.finalFiles = state_->result == state_->prs->finalFiles;
+        for (auto [side, pr] : {std::pair{&r.a, &state_->prs->a}, std::pair{&r.b, &state_->prs->b}}) {
+            side->repo = q(pr->repo->root());
+            side->base = q(pr->base);
+            side->head = q(pr->head);
+            side->title = q(pr->title);
+            side->label = q(pr->label);
+            side->cached = pr->cached;
+        }
+        r.repo = repo_ ? q(repo_->root()) : QString();
+    } else if (base_.kind == cr::Revision::Kind::Directory) {
+        r.kind = SessionRecord::Kind::Directories;
+        r.oldDir = q(base_.ref);
+        r.newDir = q(target_.ref);
+    } else if (repo_) {
+        r.kind = SessionRecord::Kind::Revisions;
+        r.repo = q(repo_->root());
+        r.base = base_;
+        r.target = target_;
+        r.prLink = currentPrLink_;
+    } else {
+        return std::nullopt;
+    }
+    // Where the reviewer is: the diff's file and first visible line, and the open file tabs.
+    const auto& files = state_->result->files;
+    if (currentFile_ >= 0 && currentFile_ < static_cast<int>(files.size())) {
+        const auto& fd = files[static_cast<size_t>(currentFile_)];
+        r.file = q(fd.path());
+        auto* v = diff_->view(fd.newPath.empty() ? cr::Side::Old : cr::Side::New);
+        for (int row = v->topRow(); row < static_cast<int>(v->rows().size()); ++row)
+            if (int l = v->lineForRow(row); l >= 0) {
+                r.line = l + 1;
+                break;
+            }
+    }
+    for (int i = 0; i < tabs_->count(); ++i)
+        if (auto* v = qobject_cast<CodeView*>(tabs_->widget(i)); v && !v->path().isEmpty())
+            r.tabs.push_back({v->side(), v->path(), std::max(0, v->lineForRow(v->topRow())) + 1});
+    return r;
+}
+
+void MainWindow::saveCurrentSession()
+{
+    if (pendingRestore_)
+        return; // not where the reviewer was yet
+    if (auto r = currentSessionRecord())
+        SessionStore::save(*r);
+}
+
+void MainWindow::resumeSession(const SessionRecord& record, bool latest)
+{
+    pendingRestore_ = record;
+    switch (record.kind) {
+    case SessionRecord::Kind::Directories:
+        compareDirectories(record.oldDir, record.newDir);
+        break;
+    case SessionRecord::Kind::PullRequests:
+        if (!record.repo.isEmpty())
+            openRepository(record.repo);
+        prRequest_ = PrRequest{record.linkA, record.linkB, record.mapping, std::nullopt, std::nullopt};
+        if (!latest) {
+            prRequest_->storedA = record.a;
+            prRequest_->storedB = record.b;
+        }
+        startPullRequestComparison();
+        break;
+    case SessionRecord::Kind::Revisions:
+        if (!openRepository(record.repo)) {
+            pendingRestore_.reset();
+            return;
+        }
+        if (latest && !record.prLink.isEmpty())
+            if (auto pr = pullRequestFromUrl(*repo_, record.prLink)) {
+                reviewPullRequest(*pr);
+                break;
+            }
+        setRevisions(record.base, record.target);
+        currentPrLink_ = record.prLink;
+        break;
+    }
+}
+
+bool MainWindow::applyPendingRestore()
+{
+    const auto r = *pendingRestore_;
+    if (r.kind == SessionRecord::Kind::PullRequests && r.finalFiles && state_->prs &&
+        state_->result == state_->prs->interdiff) {
+        setPrView(true); // restores the position once the final files are shown
+        return true;
+    }
+    pendingRestore_.reset();
+    const auto& result = *state_->result;
+    int file = result.fileIndex(cr::Side::New, r.file.toStdString());
+    const auto side = file >= 0 ? cr::Side::New : cr::Side::Old;
+    if (file < 0)
+        file = result.fileIndex(cr::Side::Old, r.file.toStdString());
+    for (const auto& t : r.tabs)
+        openWholeFile(t.side, t.path, std::max(0, t.line - 1));
+    back_.clear();
+    backAction_->setEnabled(false);
+    if (file >= 0) {
+        showFile(file);
+        tabs_->setCurrentWidget(diff_);
+        if (r.line > 0) {
+            // First visible line, as it was.
+            auto* v = diff_->view(side);
+            const int row = v->rowForLine(r.line - 1);
+            if (row >= 0)
+                for (auto* view : {diff_->view(cr::Side::Old), diff_->view(cr::Side::New)})
+                    view->verticalScrollBar()->setValue(row);
+        }
+    }
+    return false;
+}
+
+void MainWindow::setPrView(bool finalFiles)
+{
+    auto st = state_;
+    if (!st || !st->prs)
+        return;
+    if (!finalFiles) {
+        st->result = st->prs->interdiff;
+        showResult(st);
+        return;
+    }
+    if (st->prs->finalFiles) {
+        st->result = st->prs->finalFiles;
+        showResult(st);
+        return;
+    }
+    // The files after each pull request: a review between the two heads, made on first use.
+    const auto& a = st->prs->a;
+    const auto& b = st->prs->b;
+    auto session = std::make_shared<cr::ReviewSession>(a.repo, base_, b.repo, target_);
+    session->setFiles(cr::finalFilePairs(a, b, st->prs->pairs));
+    for (auto [side, pr] : {std::pair{cr::Side::Old, &a}, std::pair{cr::Side::New, &b}}) {
+        const auto db = QSettings().value(QStringLiteral("compileDb/") + q(pr->repo->root())).toString();
+        if (!pr->cached && !db.isEmpty())
+            session->setCompileDatabasePath(side, db.toStdString());
+    }
+    cr::ReviewOptions options;
+    options.ignoreWhitespace = ignoreWhitespace_->isChecked();
+    options.semantic = semantic_->isChecked();
+    QPointer<MainWindow> guard(this);
+    auto post = [guard](const std::string& stage, int done, int total) {
+        QMetaObject::invokeMethod(qApp, [guard, stage, done, total] {
+            if (guard)
+                guard->showProgress(q(stage), done, total);
+        }, Qt::QueuedConnection);
+    };
+    showProgress(tr("Exporting both pull requests…"), 0, 0);
+    struct Outcome {
+        QString error;
+        std::shared_ptr<cr::ReviewResult> result;
+    };
+    auto* watcher = new QFutureWatcher<Outcome>(this);
+    connect(watcher, &QFutureWatcher<Outcome>::finished, this, [this, watcher, st, session] {
+        watcher->deleteLater();
+        if (st != state_)
+            return;
+        auto out = watcher->result();
+        if (!out.error.isEmpty()) {
+            pendingRestore_.reset();
+            finishProgress(tr("Comparing the final files failed"));
+            QMessageBox::warning(this, tr("Final Files"), out.error);
+            updatePrViewActions();
+            return;
+        }
+        st->session = session;
+        st->prs->finalFiles = out.result;
+        st->result = out.result;
+        showResult(st);
+    });
+    watcher->setFuture(QtConcurrent::run([st, session, options, post]() {
+        Outcome out;
+        std::string err;
+        if (!session->prepare(&err, post)) {
+            out.error = q(err);
+            return out;
+        }
+        out.result = std::make_shared<cr::ReviewResult>(session->run(options, post, &st->cancel));
+        return out;
+    }));
+}
+
+void MainWindow::updatePrViewActions()
+{
+    const bool prs = state_ && state_->prs;
+    for (auto* a : {interdiffAction_, finalFilesAction_})
+        a->setVisible(prs);
+    if (prs) {
+        const bool interdiff = state_->result == state_->prs->interdiff;
+        interdiffAction_->setChecked(interdiff);
+        finalFilesAction_->setChecked(!interdiff);
+    }
+}
+
 void MainWindow::startIndexing(const std::shared_ptr<State>& st)
 {
-    if (!semantic_->isChecked())
+    if (!semantic_->isChecked() || st->indexing)
         return;
+    st->indexing = true;
     QPointer<MainWindow> guard(this);
     auto report = [guard, st](const QString& what) {
         return [guard, st, what](int done, int total) {
@@ -802,8 +1393,16 @@ void MainWindow::startIndexing(const std::shared_ptr<State>& st)
         st->session->project(cr::Side::New)->buildIndex(report(tr("target")), st->cancel);
         st->session->project(cr::Side::Old)->buildIndex(report(tr("base")), st->cancel);
         QMetaObject::invokeMethod(qApp, [guard, st] {
-            if (guard && guard->state_ == st && !st->cancel)
-                guard->statusLabel_->setText(tr("Symbol index ready — Ctrl+Click or F12 to go to definition"));
+            if (!guard || guard->state_ != st || st->cancel)
+                return;
+            int files = 0, cached = 0;
+            for (auto side : {cr::Side::Old, cr::Side::New}) {
+                files += st->session->project(side)->indexedFiles();
+                cached += st->session->project(side)->indexCacheHits();
+            }
+            guard->statusLabel_->setText(tr("Symbol index ready (%1 of %2 files from cache) — Ctrl+Click or F12 to go to definition")
+                                             .arg(cached)
+                                             .arg(files));
         }, Qt::QueuedConnection);
     });
 }
@@ -826,7 +1425,8 @@ void MainWindow::populateFiles()
                                                 QStringLiteral("+%1 −%2").arg(f.added).arg(f.removed),
                                                 semantic ? QString::number(semantic) : QString()});
         it->setData(0, RoleFile, static_cast<int>(i));
-        QColor c = f.change.status == 'A' ? theme.changeColor(cr::ChangeKind::Added)
+        QColor c = f.change.status == '=' ? palette().color(QPalette::PlaceholderText)
+                 : f.change.status == 'A' ? theme.changeColor(cr::ChangeKind::Added)
                  : f.change.status == 'D' ? theme.changeColor(cr::ChangeKind::Removed)
                  : f.change.status == 'R' ? theme.changeColor(cr::ChangeKind::Moved)
                                           : theme.changeColor(cr::ChangeKind::Modified);
@@ -834,7 +1434,15 @@ void MainWindow::populateFiles()
         QFont bold = it->font(0);
         bold.setBold(true);
         it->setFont(0, bold);
-        it->setToolTip(1, path);
+        if (f.synthetic)
+            path = f.change.status == 'A' ? q(f.newPath) : q(f.oldPath.empty() ? f.newPath : f.oldPath);
+        it->setToolTip(1, f.synthetic ? QStringLiteral("A: %1\nB: %2").arg(q(f.oldPath), q(f.newPath)) : path);
+        it->setData(1, RoleLabel, path);
+        if (f.synthetic)
+            it->setToolTip(0, f.change.status == '=' ? tr("Both pull requests change this file the same way")
+                              : f.change.status == 'A' ? tr("Only B changes this file")
+                              : f.change.status == 'D' ? tr("Only A changes this file")
+                                                       : tr("The pull requests change this file differently"));
         if (f.oldErrors || f.newErrors)
             it->setToolTip(3, tr("libclang reported %1 error(s) in base and %2 in target; semantic results may be incomplete")
                                   .arg(f.oldErrors)
@@ -844,6 +1452,7 @@ void MainWindow::populateFiles()
 
 void MainWindow::populateChanges()
 {
+    const QSignalBlocker blocker(changes_);
     changes_->clear();
     const auto& r = *state_->result;
     const auto& theme = Theme::current();
@@ -856,6 +1465,7 @@ void MainWindow::populateChanges()
             continue;
         auto* group = new QTreeWidgetItem(changes_, {groupName(kind) + QStringLiteral(" (%1)").arg(items.size())});
         group->setData(0, RoleChange, -1);
+        group->setData(0, RoleLabel, group->text(0));
         group->setForeground(0, theme.changeColor(kind));
         QFont f = group->font(0);
         f.setBold(true);
@@ -874,11 +1484,117 @@ void MainWindow::populateChanges()
             it->setToolTip(0, tip);
             if (ch.trivial)
                 it->setForeground(0, palette().color(QPalette::PlaceholderText));
+            it->setFlags(it->flags() | Qt::ItemIsUserCheckable);
+            it->setCheckState(0, changeReviewed(c) ? Qt::Checked : Qt::Unchecked);
             addRelatedItems(it, c);
         }
         // Plain modifications/additions/removals can be numerous; keep them collapsed.
         group->setExpanded(kind != cr::ChangeKind::Modified && kind != cr::ChangeKind::Added &&
                            kind != cr::ChangeKind::Removed);
+    }
+    refreshReviewMarks();
+}
+
+bool MainWindow::changeReviewed(int change) const
+{
+    return change >= 0 && static_cast<size_t>(change) < changeKeys_.size() &&
+           reviewed_.has(changeKeys_[static_cast<size_t>(change)]);
+}
+
+bool MainWindow::hunkReviewed(int file, const cr::Hunk& h) const
+{
+    if (reviewed_.has(h.key))
+        return true;
+    if (!state_ || !state_->result || file < 0 || file >= static_cast<int>(state_->result->files.size()))
+        return false;
+    // Also reviewed when every changed line belongs to a change checked as reviewed, either
+    // directly or by lying inside its range (e.g. extracted code inside a modified function).
+    const auto& r = *state_->result;
+    const auto& fd = r.files[static_cast<size_t>(file)];
+    bool any = false;
+    auto covered = [&](cr::Side side, int line, const cr::LineInfo& info) {
+        if (info.tag == cr::LineTag::None)
+            return true;
+        any = true;
+        if (changeReviewed(info.change))
+            return true;
+        const auto& path = side == cr::Side::Old ? fd.oldPath : fd.newPath;
+        for (int c : reviewedChanges_) {
+            const auto& ch = r.changes[static_cast<size_t>(c)];
+            const auto& loc = side == cr::Side::Old ? ch.oldLoc : ch.newLoc;
+            if (loc.valid() && loc.file == path && line + 1 >= loc.line && line + 1 <= std::max(loc.line, loc.endLine))
+                return true;
+        }
+        return false;
+    };
+    for (int row = h.rowBegin; row < h.rowEnd; ++row) {
+        const auto& dr = fd.rows[static_cast<size_t>(row)];
+        if (dr.oldLine >= 0 && !covered(cr::Side::Old, dr.oldLine, fd.oldInfo[static_cast<size_t>(dr.oldLine)]))
+            return false;
+        if (dr.newLine >= 0 && !covered(cr::Side::New, dr.newLine, fd.newInfo[static_cast<size_t>(dr.newLine)]))
+            return false;
+    }
+    return any;
+}
+
+void MainWindow::onChangeItemChanged(QTreeWidgetItem* it)
+{
+    bool ok = false;
+    const int c = it->data(0, RoleChange).toInt(&ok);
+    if (!ok || c < 0 || it->data(0, RoleOccurrence).isValid() || static_cast<size_t>(c) >= changeKeys_.size())
+        return;
+    const bool on = it->checkState(0) == Qt::Checked;
+    if (on == changeReviewed(c))
+        return;
+    reviewed_.set(changeKeys_[static_cast<size_t>(c)], on);
+    refreshReviewMarks();
+}
+
+void MainWindow::refreshReviewMarks()
+{
+    if (!state_ || !state_->result)
+        return;
+    reviewedChanges_.clear();
+    for (size_t c = 0; c < changeKeys_.size(); ++c)
+        if (reviewed_.has(changeKeys_[c]))
+            reviewedChanges_.push_back(static_cast<int>(c));
+    diff_->refreshFolding();
+
+    // Files: ✓ once every hunk is reviewed.
+    const auto dim = palette().color(QPalette::PlaceholderText);
+    for (int i = 0; i < files_->topLevelItemCount(); ++i) {
+        auto* it = files_->topLevelItem(i);
+        const int f = it->data(0, RoleFile).toInt();
+        if (f < 0 || static_cast<size_t>(f) >= fileHunks_.size())
+            continue;
+        const auto& hunks = fileHunks_[static_cast<size_t>(f)];
+        int done = 0;
+        for (const auto& h : hunks)
+            done += hunkReviewed(f, h) ? 1 : 0;
+        const QString label = it->data(1, RoleLabel).toString();
+        const bool all = !hunks.empty() && done == static_cast<int>(hunks.size());
+        it->setText(1, all ? QStringLiteral("✓ ") + label : label);
+        it->setForeground(1, all ? QBrush(dim) : QBrush());
+        it->setToolTip(1, label + tr("\n%1 of %2 hunk(s) reviewed").arg(done).arg(hunks.size()));
+    }
+
+    // Changes: checked ones are dimmed, groups count them.
+    const QSignalBlocker blocker(changes_);
+    for (int g = 0; g < changes_->topLevelItemCount(); ++g) {
+        auto* group = changes_->topLevelItem(g);
+        int done = 0;
+        for (int k = 0; k < group->childCount(); ++k) {
+            auto* it = group->child(k);
+            const int c = it->data(0, RoleChange).toInt();
+            const bool on = changeReviewed(c);
+            done += on ? 1 : 0;
+            it->setCheckState(0, on ? Qt::Checked : Qt::Unchecked);
+            QFont font = it->font(0);
+            font.setStrikeOut(on);
+            it->setFont(0, font);
+        }
+        const QString label = group->data(0, RoleLabel).toString();
+        group->setText(0, done ? label + tr("  ✓ %1/%2").arg(done).arg(group->childCount()) : label);
     }
     filterChanges();
 }
@@ -896,7 +1612,8 @@ void MainWindow::filterChanges()
             auto* it = group->child(k);
             int c = it->data(0, RoleChange).toInt();
             bool show = (f.isEmpty() || it->text(0).contains(f, Qt::CaseInsensitive)) &&
-                        !(hideTrivial && state_->result->changes[static_cast<size_t>(c)].trivial);
+                        !(hideTrivial && state_->result->changes[static_cast<size_t>(c)].trivial) &&
+                        !(hideReviewed_->isChecked() && changeReviewed(c));
             it->setHidden(!show);
             visible += show ? 1 : 0;
         }
@@ -908,6 +1625,19 @@ QString MainWindow::fileTitle(const cr::FileDiff& fd) const
 {
     const auto& theme = Theme::current();
     QString status;
+    if (fd.synthetic) {
+        switch (fd.change.status) {
+        case '=': status = tr("same change in both"); break;
+        case 'A': status = tr("changed only by B"); break;
+        case 'D': status = tr("changed only by A"); break;
+        default: status = tr("changed differently"); break;
+        }
+        return QStringLiteral("<b>%1</b> &nbsp;<span style='color:gray'>%2</span>%3")
+            .arg(esc(q(fd.oldPath.empty() ? fd.newPath : fd.oldPath)), status,
+                 fd.oldPath != fd.newPath && !fd.oldPath.empty() && !fd.newPath.empty()
+                     ? tr(" &nbsp;<span style='color:gray'>⇄ %1</span>").arg(esc(q(fd.newPath)))
+                     : QString());
+    }
     switch (fd.change.status) {
     case 'A': status = tr("added"); break;
     case 'D': status = tr("deleted"); break;
@@ -942,13 +1672,8 @@ void MainWindow::showFile(int index)
         if (files_->topLevelItem(i)->data(0, RoleFile).toInt() == index)
             files_->setCurrentItem(files_->topLevelItem(i));
     restoring_ = false;
-    // Start at the first change.
-    for (size_t r = 0; r < fd.rows.size(); ++r)
-        if (fd.rows[r].kind != cr::RowKind::Equal) {
-            diff_->view(cr::Side::New)->scrollToRow(static_cast<int>(r), false);
-            diff_->view(cr::Side::Old)->scrollToRow(static_cast<int>(r), false);
-            break;
-        }
+    // Start at the first change still to be reviewed.
+    diff_->scrollToFirstChange();
 }
 
 ChangeMeta MainWindow::changeMeta(int change) const
@@ -1229,6 +1954,8 @@ void MainWindow::openComparison(const cr::Location& oldLoc, const cr::Location& 
     view->setChangeMetaProvider([this](int ch) { return changeMeta(ch); });
     connect(view, &DiffView::definitionRequested, this, &MainWindow::onDefinitionRequested);
     connect(view, &DiffView::hoverRequested, this, &MainWindow::onHoverRequested);
+    connect(view, &DiffView::bookmarkRequested, this, &MainWindow::onBookmarkRequested);
+    connect(view, &DiffView::openFileRequested, this, &MainWindow::openWholeFile);
     QString title = QStringLiteral("<b>%1</b><br><span style='color:gray'>%2 &nbsp;⇄&nbsp; %3</span>")
                         .arg(esc(heading), esc(locText(oldLoc)), esc(locText(newLoc)));
     view->showDiff(fd, title, oldLoc.line - 1, newLoc.line - 1);
@@ -1251,6 +1978,7 @@ void MainWindow::connectCodeView(CodeView* v)
 {
     connect(v, &CodeView::definitionRequested, this, &MainWindow::onDefinitionRequested);
     connect(v, &CodeView::hoverRequested, this, &MainWindow::onHoverRequested);
+    connect(v, &CodeView::bookmarkRequested, this, &MainWindow::onBookmarkRequested);
 }
 
 namespace {
@@ -1526,6 +2254,342 @@ void MainWindow::mousePressEvent(QMouseEvent* e)
         return;
     }
     QMainWindow::mousePressEvent(e);
+}
+
+// ------------------------------------------------------------------------------------ files
+
+std::shared_ptr<const std::vector<std::string>> MainWindow::filesOf(State& st, cr::Side side)
+{
+    std::lock_guard lock(st.filesMutex);
+    auto& files = st.allFiles[side == cr::Side::Old ? 0 : 1];
+    if (!files && st.session)
+        files = std::make_shared<const std::vector<std::string>>(cr::listFiles(st.session->snapshot(side)));
+    return files ? files : std::make_shared<const std::vector<std::string>>();
+}
+
+void MainWindow::pushHistory(const NavPoint& before)
+{
+    if (!before.valid())
+        return;
+    back_.push_back(before);
+    forward_.clear();
+    backAction_->setEnabled(true);
+    forwardAction_->setEnabled(false);
+}
+
+void MainWindow::openWholeFile(cr::Side side, const QString& path, int line)
+{
+    if (!state_ || !state_->session)
+        return;
+    auto before = currentPosition();
+    auto* v = openFileTab(side, path, QFileInfo(path).isAbsolute());
+    v->scrollToLine(line, true);
+    v->setFocus();
+    pushHistory(before);
+}
+
+void MainWindow::openQuickOpen()
+{
+    if (!state_ || !state_->session || !state_->result)
+        return;
+    auto st = state_;
+    auto files = [this, st](cr::Side side, std::function<void(QuickOpenDialog::Files)> done) {
+        auto* watcher = new QFutureWatcher<QuickOpenDialog::Files>(this);
+        connect(watcher, &QFutureWatcher<QuickOpenDialog::Files>::finished, this, [watcher, done] {
+            watcher->deleteLater();
+            done(watcher->result());
+        });
+        watcher->setFuture(QtConcurrent::run([st, side] { return filesOf(*st, side); }));
+    };
+    const auto* v = activeCodeView();
+    QuickOpenDialog dlg(files, v ? v->side() : cr::Side::New, this);
+    if (dlg.exec() != QDialog::Accepted || st != state_)
+        return;
+    cr::Location loc;
+    loc.file = dlg.path().toStdString();
+    loc.line = std::max(1, dlg.line());
+    navigateTo(dlg.side(), loc);
+}
+
+// ------------------------------------------------------------------------------------ search
+
+CodeView* MainWindow::activeCodeView() const
+{
+    auto* w = tabs_->currentWidget();
+    if (auto* d = qobject_cast<DiffView*>(w)) {
+        if (lastCodeView_ && (lastCodeView_ == d->view(cr::Side::Old) || lastCodeView_ == d->view(cr::Side::New)))
+            return lastCodeView_;
+        return d->view(cr::Side::New);
+    }
+    return qobject_cast<CodeView*>(w);
+}
+
+void MainWindow::applySearch()
+{
+    const QString text = findBar_->text();
+    const auto flags = findBar_->flags();
+    auto* target = activeCodeView();
+    // Both sides of the current diff show the matches; the active side is searched.
+    auto* d = qobject_cast<DiffView*>(tabs_->currentWidget());
+    for (auto* v : findChildren<CodeView*>()) {
+        const bool here = v == target || (d && (v == d->view(cr::Side::Old) || v == d->view(cr::Side::New)));
+        v->setSearch(here ? text : QString(), flags);
+    }
+    if (!target) {
+        findBar_->setMatchInfo(0, false);
+        return;
+    }
+    bool found = false;
+    if (!text.isEmpty()) {
+        // Incremental: keep the current match if it still matches.
+        auto c = target->textCursor();
+        c.setPosition(c.selectionStart());
+        target->setTextCursor(c);
+        found = target->findNext(false);
+    }
+    findBar_->setMatchInfo(target->searchMatchCount(), found);
+}
+
+void MainWindow::findInView(bool backward)
+{
+    if (!findBar_->isVisible() || findBar_->text().isEmpty()) {
+        auto* v = activeCodeView();
+        findBar_->activate(v ? v->textCursor().selectedText() : QString());
+        return;
+    }
+    auto* v = activeCodeView();
+    if (!v)
+        return;
+    const bool found = v->findNext(backward);
+    findBar_->setMatchInfo(v->searchMatchCount(), found);
+}
+
+void MainWindow::closeFindBar()
+{
+    findBar_->hide();
+    for (auto* v : findChildren<CodeView*>())
+        v->setSearch({}, {});
+    if (auto* v = activeCodeView())
+        v->setFocus();
+}
+
+void MainWindow::startFileSearch()
+{
+    if (!state_ || !state_->session || !state_->result)
+        return;
+    if (searchCancel_)
+        *searchCancel_ = true;
+    searchCancel_ = std::make_shared<std::atomic<bool>>(false);
+    searchResults_->clear();
+
+    SearchQuery query;
+    query.text = searchEdit_->text();
+    query.caseSensitive = searchCase_->isChecked();
+    query.wholeWord = searchWord_->isChecked();
+    query.regex = searchRegex_->isChecked();
+    if (query.text.isEmpty())
+        return;
+    const int scope = searchScope_->currentIndex();
+    std::vector<SearchTarget> changed;
+    if (scope == 0) {
+        SearchTarget oldT{cr::Side::Old, state_->session->snapshot(cr::Side::Old).root, {}};
+        SearchTarget newT{cr::Side::New, state_->session->snapshot(cr::Side::New).root, {}};
+        for (const auto& f : state_->result->files) {
+            if (!f.newPath.empty())
+                newT.files.push_back(f.newPath);
+            else if (!f.oldPath.empty())
+                oldT.files.push_back(f.oldPath);
+        }
+        changed = {newT, oldT};
+    }
+    searchInfo_->setText(tr("Searching…"));
+
+    struct Outcome {
+        std::vector<SearchHit> hits;
+        bool truncated = false;
+        QString error;
+    };
+    auto st = state_;
+    auto cancel = searchCancel_;
+    auto* watcher = new QFutureWatcher<Outcome>(this);
+    connect(watcher, &QFutureWatcher<Outcome>::finished, this, [this, watcher, st, cancel] {
+        watcher->deleteLater();
+        if (st != state_ || *cancel)
+            return;
+        auto out = watcher->result();
+        if (!out.error.isEmpty()) {
+            searchInfo_->setText(tr("<span style='color:#cf222e'>%1</span>").arg(esc(out.error)));
+            return;
+        }
+        const QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        QTreeWidgetItem* group = nullptr;
+        QString groupKey;
+        int files = 0;
+        for (const auto& h : out.hits) {
+            const QString key = QString::number(static_cast<int>(h.side)) + h.path;
+            if (!group || key != groupKey) {
+                group = new QTreeWidgetItem(searchResults_, {h.path + (h.side == cr::Side::Old ? tr(" (base)") : QString())});
+                group->setData(0, RoleOccurrence, 0);
+                QFont bold = group->font(0);
+                bold.setBold(true);
+                group->setFont(0, bold);
+                group->setExpanded(true);
+                groupKey = key;
+                ++files;
+            }
+            auto* it = new QTreeWidgetItem(group, {QStringLiteral("%1: %2").arg(h.line, 5).arg(h.text.trimmed())});
+            it->setFont(0, mono);
+            it->setData(0, RoleChange, static_cast<int>(h.side));
+            it->setData(0, RoleFile, h.path);
+            it->setData(0, RoleOccurrence, h.line);
+            it->setToolTip(0, h.path + QLatin1Char(':') + QString::number(h.line));
+        }
+        for (int i = 0; i < searchResults_->topLevelItemCount(); ++i) {
+            auto* g = searchResults_->topLevelItem(i);
+            g->setText(0, g->text(0) + QStringLiteral("  (%1)").arg(g->childCount()));
+        }
+        searchInfo_->setText(tr("%1 in %2%3")
+                                 .arg(tr("%n match(es)", nullptr, static_cast<int>(out.hits.size())))
+                                 .arg(tr("%n file(s)", nullptr, files))
+                                 .arg(out.truncated ? tr(" (stopped at the limit)") : QString()));
+    });
+    watcher->setFuture(QtConcurrent::run([st, cancel, query, scope, changed] {
+        std::vector<SearchTarget> targets = changed;
+        if (scope != 0) {
+            const auto side = scope == 1 ? cr::Side::New : cr::Side::Old;
+            targets.push_back({side, st->session->snapshot(side).root, *filesOf(*st, side)});
+        }
+        Outcome out;
+        out.hits = searchFiles(targets, query, *cancel, 5000, out.truncated, &out.error);
+        return out;
+    }));
+}
+
+// ------------------------------------------------------------------------------------ bookmarks
+
+void MainWindow::onBookmarkRequested(CodeView* v, int line, BookmarkAction action)
+{
+    if (!v || v->path().isEmpty() || line < 0)
+        return;
+    const QString path = v->path();
+    const auto side = QFileInfo(path).isAbsolute() ? cr::Side::New : v->side();
+    int index = bookmarks_.indexOf(side, path, line);
+    if (action == BookmarkAction::Remove || (action == BookmarkAction::Toggle && index >= 0)) {
+        bookmarks_.remove(index);
+        statusLabel_->setText(tr("Bookmark removed"));
+    } else if (index < 0) {
+        Bookmark b;
+        b.side = side;
+        b.path = path;
+        b.line = line;
+        const auto lines = fileLines(side, path);
+        if (static_cast<size_t>(line) < lines.size())
+            b.text = q(lines[static_cast<size_t>(line)]);
+        b.revision = q(side == cr::Side::Old ? base_.display() : target_.display());
+        b.created = QDateTime::currentDateTime();
+        bookmarks_.add(b);
+        index = bookmarks_.indexOf(side, path, line);
+        statusLabel_->setText(tr("Bookmarked %1:%2").arg(path).arg(line + 1));
+    }
+    if (action == BookmarkAction::EditComment && index >= 0)
+        editBookmarkComment(index); // repopulates
+    else
+        populateBookmarks();
+}
+
+void MainWindow::bookmarkAtCursor(BookmarkAction action)
+{
+    auto* v = activeCodeView();
+    const int line = v ? v->lineForRow(v->cursorRow()) : -1;
+    if (line < 0) {
+        statusLabel_->setText(tr("Put the cursor on a code line to bookmark it"));
+        return;
+    }
+    onBookmarkRequested(v, line, action);
+}
+
+void MainWindow::editBookmarkComment(int index)
+{
+    if (index < 0 || index >= bookmarks_.items().size())
+        return;
+    const auto& b = bookmarks_.items()[index];
+    bool ok = false;
+    const QString text = QInputDialog::getMultiLineText(
+        this, tr("Comment"),
+        tr("<b>%1:%2</b>%3<br><code>%4</code>")
+            .arg(esc(b.path))
+            .arg(b.line + 1)
+            .arg(b.side == cr::Side::Old ? tr(" (base)") : QString(), esc(b.text.trimmed().left(120))),
+        b.comment, &ok);
+    if (ok)
+        bookmarks_.setComment(index, text.trimmed());
+    populateBookmarks();
+}
+
+void MainWindow::populateBookmarks()
+{
+    bookmarkList_->clear();
+    const auto dim = palette().color(QPalette::PlaceholderText);
+    const QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    const auto& items = bookmarks_.items();
+    for (int i = 0; i < items.size(); ++i) {
+        const auto& b = items[i];
+        QString where = QFileInfo(b.path).fileName() + QLatin1Char(':') + QString::number(b.line + 1);
+        if (b.side == cr::Side::Old)
+            where += tr(" (base)");
+        auto* it = new QTreeWidgetItem(bookmarkList_, {where, b.comment.section(QLatin1Char('\n'), 0, 0), b.text.trimmed()});
+        it->setData(0, RoleOccurrence, i);
+        it->setFont(2, mono);
+        QString tip = QStringLiteral("<b>%1:%2</b>").arg(esc(b.path)).arg(b.line + 1);
+        if (!b.revision.isEmpty())
+            tip += tr("<br>made on %1").arg(esc(b.revision));
+        if (!b.comment.isEmpty())
+            tip += QStringLiteral("<br><br>") + esc(b.comment).replace(QLatin1Char('\n'), QStringLiteral("<br>"));
+        if (b.stale) {
+            tip += tr("<br><i>This line isn't in the current revisions any more.</i>");
+            for (int c = 0; c < 3; ++c)
+                it->setForeground(c, dim);
+            it->setText(0, QStringLiteral("⚠ ") + where);
+        }
+        for (int c = 0; c < 3; ++c)
+            it->setToolTip(c, tip);
+    }
+    bookmarkList_->resizeColumnToContents(0);
+    bookmarksDock_->setWindowTitle(items.isEmpty() ? tr("Bookmarks") : tr("Bookmarks (%1)").arg(items.size()));
+    for (auto* v : findChildren<CodeView*>())
+        v->refreshMarks();
+}
+
+void MainWindow::gotoBookmark(int index)
+{
+    if (index < 0 || index >= bookmarks_.items().size())
+        return;
+    const auto& b = bookmarks_.items()[index];
+    bookmarkCursor_ = index;
+    if (b.stale) {
+        statusLabel_->setText(tr("%1:%2 isn't in the current revisions").arg(b.path).arg(b.line + 1));
+        return;
+    }
+    cr::Location loc;
+    loc.file = b.path.toStdString();
+    loc.line = b.line + 1;
+    loc.external = QFileInfo(b.path).isAbsolute();
+    navigateTo(b.side, loc);
+    statusLabel_->setText(b.comment.isEmpty() ? tr("Bookmark %1 of %2").arg(index + 1).arg(bookmarks_.items().size())
+                                              : b.comment.section(QLatin1Char('\n'), 0, 0));
+}
+
+void MainWindow::stepBookmark(bool forward)
+{
+    const int n = static_cast<int>(bookmarks_.items().size());
+    for (int k = 1; k <= n; ++k) {
+        const int i = ((bookmarkCursor_ < 0 ? (forward ? -1 : 0) : bookmarkCursor_) + (forward ? k : -k) + n * 2) % n;
+        if (!bookmarks_.items()[i].stale) {
+            gotoBookmark(i);
+            return;
+        }
+    }
+    statusLabel_->setText(tr("No bookmarks"));
 }
 
 } // namespace gui

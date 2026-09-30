@@ -19,6 +19,8 @@ public:
 
     explicit CppHighlighter(QTextDocument* doc);
     void setExtraProvider(ExtraProvider p) { extras_ = std::move(p); }
+    // Blocks that aren't code (e.g. placeholders of folded hunks); drawn like comments.
+    void setPlainProvider(std::function<bool(int blockNumber)> p) { plain_ = std::move(p); }
     // Rebuilds the formats for the current Theme and re-highlights.
     void applyTheme();
 
@@ -34,6 +36,7 @@ private:
     QTextCharFormat comment_, string_, preproc_;
     QRegularExpression commentStart_, commentEnd_;
     ExtraProvider extras_;
+    std::function<bool(int)> plain_;
 };
 
 } // namespace gui

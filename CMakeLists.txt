@@ -37,8 +37,10 @@ add_library(cppreview_core STATIC
     src/core/Git.cpp
     src/core/Json.cpp
     src/core/Model.cpp
+    src/core/PrCompare.cpp
     src/core/Process.cpp
     src/core/Review.cpp
+    src/core/Reviewed.cpp
     src/core/SemanticDiff.cpp
     src/core/Session.cpp
     src/core/Snapshot.cpp
@@ -64,6 +66,12 @@ if(CPPREVIEW_BUILD_GUI)
         src/gui/CppHighlighter.cpp
         src/gui/RevisionDialog.cpp
         src/gui/GitHubClient.cpp
+        src/gui/Bookmarks.cpp
+        src/gui/CompareDialog.cpp
+        src/gui/FileSearch.cpp
+        src/gui/FindBar.cpp
+        src/gui/QuickOpen.cpp
+        src/gui/Sessions.cpp
     )
     target_link_libraries(cppreviewer PRIVATE cppreview_core Qt6::Widgets Qt6::Network Qt6::Concurrent)
     target_compile_options(cppreviewer PRIVATE -Wall -Wextra)

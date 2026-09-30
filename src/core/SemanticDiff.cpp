@@ -865,6 +865,22 @@ private:
         Location firstOld, firstNew;
     };
 
+    // Token ranges of the statements of `e` already explained by an extraction or inlining.
+    static std::vector<std::pair<int, int>> consumedRanges(const Entity& e,
+                                                           const std::set<std::pair<const Entity*, int>>& consumed)
+    {
+        std::vector<std::pair<int, int>> out;
+        for (size_t k = 0; k < e.stmts.size(); ++k)
+            if (consumed.count({&e, static_cast<int>(k)}))
+                out.emplace_back(e.stmts[k].tokBegin, e.stmts[k].tokEnd);
+        return out;
+    }
+
+    static bool inRanges(const std::vector<std::pair<int, int>>& ranges, int tok)
+    {
+        return std::any_of(ranges.begin(), ranges.end(), [&](auto r) { return tok >= r.first && tok < r.second; });
+    }
+
     void detectIdentifierRenames()
     {
         std::map<std::pair<std::string, std::string>, RenameStats> accepted;
@@ -899,6 +915,11 @@ private:
             if (oids.size() != opos.size() || nids.size() != npos.size())
                 continue;
 
+            // Code that moved into (or came from) another function is aligned against unrelated
+            // code here, e.g. the call replacing an extracted body; it says nothing about renames.
+            const auto movedOld = consumedRanges(o, consumedOld_);
+            const auto movedNew = consumedRanges(n, consumedNew_);
+
             std::map<std::string, std::map<std::string, int>> votes;
             std::map<std::string, int> kept;
             std::map<std::string, std::pair<Location, Location>> firstSeen;
@@ -924,8 +945,12 @@ private:
                 if (del->aEnd - del->aBegin != ins->bEnd - ins->bBegin)
                     continue;
                 for (int d = 0; d < del->aEnd - del->aBegin; ++d) {
-                    const auto& a = ot[static_cast<size_t>(opos[static_cast<size_t>(del->aBegin + d)])];
-                    const auto& b = nt[static_cast<size_t>(npos[static_cast<size_t>(ins->bBegin + d)])];
+                    const int ta = opos[static_cast<size_t>(del->aBegin + d)];
+                    const int tb = npos[static_cast<size_t>(ins->bBegin + d)];
+                    if (inRanges(movedOld, ta) || inRanges(movedNew, tb))
+                        continue;
+                    const auto& a = ot[static_cast<size_t>(ta)];
+                    const auto& b = nt[static_cast<size_t>(tb)];
                     if (a.kind == TokKind::Ident && b.kind == TokKind::Ident && a.text != b.text) {
                         ++votes[a.text][b.text];
                         if (!firstSeen.count(a.text)) {

@@ -11,6 +11,7 @@
 #include <QLineEdit>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTabWidget>
 #include <QTreeWidget>
@@ -183,12 +184,39 @@ std::optional<cr::Revision> RevisionDialog::selectedRevision() const
 
 // ---------------------------------------------------------------------------------------------
 
+std::optional<PullRequestChoice> pullRequestFromUrl(const cr::GitRepo& repo, const QString& text, QString* note)
+{
+    auto url = cr::parsePullRequestUrl(text.toStdString());
+    if (!url)
+        return std::nullopt;
+    PullRequestChoice c;
+    c.number = url->number;
+    c.host = q(url->host);
+    c.slug = q(url->slug);
+    const auto remote = repo.remoteFor(url->host, url->slug);
+    c.remote = remote.empty() ? q(url->fetchUrl()) : q(remote);
+    if (note)
+        *note = remote.empty()
+                    ? QObject::tr("⚠ No remote of this repository points to %1; fetching from %2.")
+                          .arg(c.slug, c.remote)
+                    : QObject::tr("%1 #%2, fetched from remote '%3'.").arg(c.slug).arg(c.number).arg(c.remote);
+    return c;
+}
+
 PullRequestDialog::PullRequestDialog(const cr::GitRepo& repo, QWidget* parent)
     : QDialog(parent), repo_(repo), client_(new GitHubClient(this))
 {
     setWindowTitle(tr("Review Pull Request"));
     resize(820, 480);
     auto* layout = new QVBoxLayout(this);
+
+    auto* linkRow = new QHBoxLayout;
+    link_ = new QLineEdit;
+    link_->setPlaceholderText(tr("Paste a pull request link, e.g. https://github.com/owner/repo/pull/123"));
+    link_->setClearButtonEnabled(true);
+    linkRow->addWidget(new QLabel(tr("Link:")));
+    linkRow->addWidget(link_, 1);
+    layout->addLayout(linkRow);
 
     auto* top = new QHBoxLayout;
     remote_ = new QComboBox;
@@ -219,7 +247,7 @@ PullRequestDialog::PullRequestDialog(const cr::GitRepo& repo, QWidget* parent)
     number_ = new QSpinBox;
     number_->setRange(1, 10000000);
     base_ = new QLineEdit;
-    base_->setPlaceholderText(tr("base branch, e.g. main"));
+    base_->setPlaceholderText(tr("empty: the pull request's target branch"));
     form->addRow(tr("Pull request number:"), number_);
     form->addRow(tr("Base branch:"), base_);
     layout->addLayout(form);
@@ -238,6 +266,39 @@ PullRequestDialog::PullRequestDialog(const cr::GitRepo& repo, QWidget* parent)
         base_->setText(it->data(0, Qt::UserRole).toString());
     });
     connect(list_, &QTreeWidget::itemDoubleClicked, this, &QDialog::accept);
+    connect(link_, &QLineEdit::textChanged, this, [this](const QString& text) {
+        QString note;
+        auto pr = pullRequestFromUrl(repo_, text, &note);
+        if (!pr) {
+            fromLink_ = false;
+            if (!text.trimmed().isEmpty())
+                status_->setText(tr("Not a pull request link."));
+            return;
+        }
+        fromLink_ = true;
+        status_->setText(note);
+        int i = remote_->findText(pr->remote);
+        if (i < 0) {
+            remote_->addItem(pr->remote);
+            i = remote_->count() - 1;
+        }
+        remote_->setCurrentIndex(i); // lists that repository's pull requests
+        number_->setValue(pr->number);
+        base_->clear();
+        title_.clear();
+        client_->getPullRequest(pr->host, pr->slug, pr->number, [this, pr = *pr, note](PullRequestInfo info, QString error) {
+            if (number_->value() != pr.number)
+                return;
+            if (!error.isEmpty()) {
+                status_->setText(note + QLatin1Char(' ') +
+                                 tr("Details unavailable (%1); the base is the PR's target branch.").arg(error));
+                return;
+            }
+            base_->setText(info.baseRef);
+            title_ = info.title;
+            status_->setText(note + QStringLiteral(" <b>%1</b> (%2 ← %3)").arg(info.title.toHtmlEscaped(), info.baseRef, info.headRef));
+        });
+    });
     refresh();
 }
 
@@ -245,19 +306,27 @@ void PullRequestDialog::refresh()
 {
     list_->clear();
     const auto remote = remote_->currentText().toStdString();
-    const auto def = repo_.remoteDefaultBranch(remote);
-    if (base_->text().isEmpty())
+    const bool isUrl = remote.find("://") != std::string::npos;
+    if (base_->text().isEmpty() && !fromLink_) {
+        const auto def = isUrl ? std::string() : repo_.remoteDefaultBranch(remote);
         base_->setText(def.empty() ? QStringLiteral("main") : q(def));
-    const auto slug = q(cr::gitHubSlugFromUrl(repo_.remoteUrl(remote)));
+    }
+    std::string hostStd, slugStd;
+    cr::hostAndSlugFromUrl(isUrl ? remote : repo_.remoteUrl(remote), hostStd, slugStd);
+    const auto host = q(hostStd);
+    const auto slug = q(slugStd);
     if (slug.isEmpty()) {
         status_->setText(tr("Remote '%1' is not hosted on GitHub; enter the pull request number manually "
                             "(fetched from refs/pull/N/head).")
                              .arg(remote_->currentText()));
         return;
     }
-    status_->setText(tr("Loading pull requests of %1…").arg(slug));
-    client_->listPullRequests(slug, [this, slug](QVector<PullRequestInfo> prs, QString error) {
+    if (!fromLink_)
+        status_->setText(tr("Loading pull requests of %1…").arg(slug));
+    client_->listPullRequests(host, slug, [this, slug](QVector<PullRequestInfo> prs, QString error) {
         if (!error.isEmpty()) {
+            if (fromLink_)
+                return; // keep showing what the pasted link resolved to
             status_->setText(tr("Could not list pull requests of %1: %2. Set GITHUB_TOKEN for private repositories, "
                                 "or enter the number manually.")
                                  .arg(slug, error));
@@ -272,7 +341,13 @@ void PullRequestDialog::refresh()
         }
         list_->resizeColumnToContents(0);
         list_->resizeColumnToContents(3);
-        status_->setText(tr("%n open pull request(s) in %1.", nullptr, static_cast<int>(prs.size())).arg(slug));
+        for (int i = 0; i < list_->topLevelItemCount(); ++i)
+            if (list_->topLevelItem(i)->text(0).toInt() == number_->value() && fromLink_) {
+                const QSignalBlocker block(list_); // keep the base/title from the link
+                list_->setCurrentItem(list_->topLevelItem(i));
+            }
+        if (!fromLink_)
+            status_->setText(tr("%n open pull request(s) in %1.", nullptr, static_cast<int>(prs.size())).arg(slug));
     });
 }
 
@@ -284,6 +359,8 @@ PullRequestChoice PullRequestDialog::choice() const
     c.baseRef = base_->text().trimmed();
     if (auto* it = list_->currentItem(); it && it->text(0).toInt() == c.number)
         c.title = it->data(1, Qt::UserRole).toString();
+    else if (fromLink_)
+        c.title = title_;
     return c;
 }
 

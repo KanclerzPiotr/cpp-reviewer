@@ -57,6 +57,11 @@ void CppHighlighter::applyTheme()
 
 void CppHighlighter::highlightBlock(const QString& text)
 {
+    if (plain_ && plain_(currentBlock().blockNumber())) {
+        setFormat(0, static_cast<int>(text.size()), comment_);
+        setCurrentBlockState(previousBlockState()); // a block comment continues past it
+        return;
+    }
     for (const auto& r : rules_) {
         auto it = r.re.globalMatch(text);
         while (it.hasNext()) {

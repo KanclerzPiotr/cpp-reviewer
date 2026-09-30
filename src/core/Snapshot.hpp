@@ -54,5 +54,7 @@ bool isHeaderFile(const std::string& path);
 
 // Every C/C++ source or header file in the snapshot (relative paths), skipping VCS/build dirs.
 std::vector<std::string> listCppFiles(const Snapshot& snap);
+// Every file in the snapshot (relative paths, sorted), skipping VCS/build dirs.
+std::vector<std::string> listFiles(const Snapshot& snap);
 
 } // namespace cr
