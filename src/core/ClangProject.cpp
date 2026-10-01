@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -439,6 +440,216 @@ std::shared_ptr<ClangProject::Tu> ClangProject::acquireTu(const std::string& abs
     return t;
 }
 
+// ------------------------------------------------------------------------- parse cache
+
+namespace {
+
+// On-disk cache of parsed files (tokens, entities, diagnostics), so reopening a review doesn't
+// parse its files again. Keyed by the file's content, its compile flags and the libclang
+// version; an entry also lists every file the translation unit included with its size and
+// modification time, and is only used while all of them are unchanged.
+// Bump the version whenever the extraction (Extractor, Token, Entity...) changes.
+constexpr const char* kParseCacheVersion = "cppreviewer-parse-1";
+
+class Writer {
+public:
+    void u32(uint32_t v) { raw(&v, sizeof v); }
+    void i32(int v) { u32(static_cast<uint32_t>(v)); }
+    void u64(uint64_t v) { raw(&v, sizeof v); }
+    void str(const std::string& v)
+    {
+        u32(static_cast<uint32_t>(v.size()));
+        buf_.append(v);
+    }
+    const std::string& data() const { return buf_; }
+
+private:
+    void raw(const void* p, size_t n) { buf_.append(static_cast<const char*>(p), n); }
+    std::string buf_;
+};
+
+class Reader {
+public:
+    explicit Reader(const std::string& d) : d_(d) {}
+    bool ok() const { return ok_; }
+    bool atEnd() const { return pos_ == d_.size(); }
+    uint32_t u32() { uint32_t v = 0; raw(&v, sizeof v); return v; }
+    int i32() { return static_cast<int>(u32()); }
+    uint64_t u64() { uint64_t v = 0; raw(&v, sizeof v); return v; }
+    std::string str()
+    {
+        const uint32_t n = u32();
+        if (!ok_ || n > d_.size() - pos_) {
+            ok_ = false;
+            return {};
+        }
+        std::string v = d_.substr(pos_, n);
+        pos_ += n;
+        return v;
+    }
+    // A count of items that take at least `minSize` bytes each, checked against what is left.
+    uint32_t count(size_t minSize)
+    {
+        const uint32_t n = u32();
+        if (ok_ && static_cast<uint64_t>(n) * minSize > d_.size() - pos_)
+            ok_ = false;
+        return ok_ ? n : 0;
+    }
+
+private:
+    void raw(void* p, size_t n)
+    {
+        if (!ok_ || n > d_.size() - pos_) {
+            ok_ = false;
+            return;
+        }
+        std::memcpy(p, d_.data() + pos_, n);
+        pos_ += n;
+    }
+    const std::string& d_;
+    size_t pos_ = 0;
+    bool ok_ = true;
+};
+
+std::optional<FileStamp> stampOf(const std::string& path)
+{
+    std::error_code ec;
+    const auto size = fs::file_size(path, ec);
+    if (ec)
+        return std::nullopt;
+    const auto time = fs::last_write_time(path, ec);
+    if (ec)
+        return std::nullopt;
+    return FileStamp{path, static_cast<uint64_t>(size), static_cast<uint64_t>(time.time_since_epoch().count())};
+}
+
+std::string parseCachePath(uint64_t key)
+{
+    char name[24];
+    std::snprintf(name, sizeof name, "%016llx", static_cast<unsigned long long>(key));
+    return (fs::path(cacheDirectory()) / "parsed" / std::string(name, 2) / name).string();
+}
+
+void writeParsed(Writer& w, const ParsedFile& pf, const std::vector<FileStamp>& deps)
+{
+    w.u32(static_cast<uint32_t>(deps.size()));
+    for (const auto& d : deps) {
+        w.str(d.path);
+        w.u64(d.size);
+        w.u64(d.mtime);
+    }
+    w.i32(pf.errorCount);
+    w.u32(static_cast<uint32_t>(pf.diagnostics.size()));
+    for (const auto& d : pf.diagnostics)
+        w.str(d);
+    w.u32(static_cast<uint32_t>(pf.tokens.size()));
+    for (const auto& t : pf.tokens) {
+        w.str(t.text);
+        w.u32(static_cast<uint32_t>(t.kind));
+        w.i32(t.line);
+        w.i32(t.col);
+        w.u32(t.offset);
+    }
+    w.u32(static_cast<uint32_t>(pf.entities.size()));
+    for (const auto& e : pf.entities) {
+        w.u32(static_cast<uint32_t>(e.kind));
+        for (const auto* v : {&e.kindName, &e.name, &e.qualifiedName, &e.scope, &e.params, &e.signature, &e.usr, &e.file})
+            w.str(*v);
+        w.u32(e.isMember ? 1 : 0);
+        for (int v : {e.beginLine, e.endLine, e.tokBegin, e.tokEnd, e.bodyTokBegin, e.bodyTokEnd})
+            w.i32(v);
+        w.u32(static_cast<uint32_t>(e.stmts.size()));
+        for (const auto& st : e.stmts) {
+            for (int v : {st.tokBegin, st.tokEnd, st.beginLine, st.endLine, st.parent, st.block, st.indexInBlock, st.depth})
+                w.i32(v);
+            w.u64(st.exactHash);
+            w.u64(st.normHash);
+        }
+        w.u32(static_cast<uint32_t>(e.calls.size()));
+        for (const auto& c : e.calls)
+            w.str(c);
+        w.u32(static_cast<uint32_t>(e.skipRanges.size()));
+        for (const auto& [b, en] : e.skipRanges) {
+            w.i32(b);
+            w.i32(en);
+        }
+        w.u64(e.exactHash);
+        w.u64(e.normHash);
+    }
+}
+
+// Reads an entry; false when it is damaged or one of the included files has changed.
+bool readParsed(const std::string& data, ParsedFile& pf)
+{
+    Reader r(data);
+    const uint32_t ndeps = r.count(20);
+    for (uint32_t i = 0; i < ndeps && r.ok(); ++i) {
+        FileStamp d;
+        d.path = r.str();
+        d.size = r.u64();
+        d.mtime = r.u64();
+        const auto now = stampOf(d.path);
+        if (!r.ok() || !now || now->size != d.size || now->mtime != d.mtime)
+            return false;
+    }
+    pf.errorCount = r.i32();
+    const uint32_t ndiag = r.count(4);
+    for (uint32_t i = 0; i < ndiag && r.ok(); ++i)
+        pf.diagnostics.push_back(r.str());
+    const uint32_t ntok = r.count(20);
+    pf.tokens.resize(ntok);
+    for (auto& t : pf.tokens) {
+        t.text = r.str();
+        t.kind = static_cast<TokKind>(r.u32());
+        t.line = r.i32();
+        t.col = r.i32();
+        t.offset = r.u32();
+    }
+    const uint32_t nent = r.count(80);
+    pf.entities.resize(nent);
+    for (auto& e : pf.entities) {
+        if (!r.ok())
+            return false;
+        e.kind = static_cast<EntityKind>(r.u32());
+        for (auto* v : {&e.kindName, &e.name, &e.qualifiedName, &e.scope, &e.params, &e.signature, &e.usr, &e.file})
+            *v = r.str();
+        e.isMember = r.u32() != 0;
+        for (int* v : {&e.beginLine, &e.endLine, &e.tokBegin, &e.tokEnd, &e.bodyTokBegin, &e.bodyTokEnd})
+            *v = r.i32();
+        e.stmts.resize(r.count(48));
+        for (auto& st : e.stmts) {
+            for (int* v : {&st.tokBegin, &st.tokEnd, &st.beginLine, &st.endLine, &st.parent, &st.block, &st.indexInBlock, &st.depth})
+                *v = r.i32();
+            st.exactHash = r.u64();
+            st.normHash = r.u64();
+        }
+        const uint32_t ncalls = r.count(4);
+        for (uint32_t i = 0; i < ncalls && r.ok(); ++i)
+            e.calls.insert(r.str());
+        e.skipRanges.resize(r.count(8));
+        for (auto& [b, en] : e.skipRanges) {
+            b = r.i32();
+            en = r.i32();
+        }
+        e.exactHash = r.u64();
+        e.normHash = r.u64();
+    }
+    return r.ok() && r.atEnd();
+}
+
+} // namespace
+
+uint64_t ClangProject::parseCacheKey(const std::string& abs, const std::string& content) const
+{
+    static const std::string clangVersion = toStd(clang_getClangVersion());
+    uint64_t key = hashCombine(hashString(kParseCacheVersion), hashString(clangVersion));
+    key = hashCombine(key, hashString(abs));
+    key = hashCombine(key, hashString(content));
+    for (const auto& a : argsFor(abs))
+        key = hashCombine(key, hashString(a));
+    return key;
+}
+
 std::shared_ptr<const ParsedFile> ClangProject::parse(const std::string& relPath)
 {
     {
@@ -447,9 +658,61 @@ std::shared_ptr<const ParsedFile> ClangProject::parse(const std::string& relPath
             return it->second;
     }
 
+    const auto abs = absPath(relPath);
+    std::shared_ptr<ParsedFile> pf;
+    std::string content;
+    uint64_t key = 0;
+    if (std::ifstream in{abs, std::ios::binary}) {
+        content.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        key = parseCacheKey(abs, content);
+        std::string data;
+        if (std::ifstream cached{parseCachePath(key), std::ios::binary})
+            data.assign(std::istreambuf_iterator<char>(cached), std::istreambuf_iterator<char>());
+        auto fromCache = std::make_shared<ParsedFile>();
+        if (!data.empty() && readParsed(data, *fromCache)) {
+            fromCache->path = relPath;
+            fromCache->parsed = true;
+            pf = std::move(fromCache);
+            ++parseCacheHits_;
+        }
+    }
+    if (!pf) {
+        std::vector<FileStamp> deps;
+        pf = parseUncached(relPath, abs, &deps);
+        // The included files must not have changed while it was parsed; the file itself is
+        // covered by the key.
+        if (pf->parsed && key != 0 && !deps.empty())
+            if (auto self = stampOf(abs)) {
+                deps.push_back(*self);
+                Writer w;
+                writeParsed(w, *pf, deps);
+                const auto path = parseCachePath(key);
+                std::error_code ec;
+                fs::create_directories(fs::path(path).parent_path(), ec);
+                const auto tmp = path + ".tmp" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                bool written = false;
+                {
+                    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                    out.write(w.data().data(), static_cast<std::streamsize>(w.data().size()));
+                    written = static_cast<bool>(out);
+                }
+                if (written)
+                    fs::rename(tmp, path, ec);
+                if (!written || ec)
+                    fs::remove(tmp, ec);
+            }
+    }
+
+    std::lock_guard lock(parsedMutex_);
+    auto [it, inserted] = parsed_.emplace(relPath, std::move(pf));
+    return it->second;
+}
+
+std::shared_ptr<ParsedFile> ClangProject::parseUncached(const std::string& relPath, const std::string& abs,
+                                                        std::vector<FileStamp>* deps)
+{
     auto pf = std::make_shared<ParsedFile>();
     pf->path = relPath;
-    const auto abs = absPath(relPath);
     auto t = fs::exists(abs) ? acquireTu(abs, false) : nullptr;
     if (t) {
         std::lock_guard tuLock(t->mutex);
@@ -494,11 +757,28 @@ std::shared_ptr<const ParsedFile> ClangProject::parse(const std::string& relPath
             Extractor(*pf, file).run(clang_getTranslationUnitCursor(tu));
             pf->parsed = true;
         }
+        if (deps) {
+            // Everything the translation unit read, for validating a cached copy.
+            struct Ctx {
+                std::vector<FileStamp>* deps;
+                bool complete = true;
+            } ctx{deps};
+            clang_getInclusions(
+                tu,
+                [](CXFile included, CXSourceLocation*, unsigned, CXClientData data) {
+                    auto* c = static_cast<Ctx*>(data);
+                    if (auto st = stampOf(toStd(clang_getFileName(included))))
+                        c->deps->push_back(std::move(*st));
+                    else
+                        c->complete = false;
+                },
+                &ctx);
+            // A file that can't be checked later: don't cache.
+            if (!ctx.complete)
+                deps->clear();
+        }
     }
-
-    std::lock_guard lock(parsedMutex_);
-    auto [it, inserted] = parsed_.emplace(relPath, pf);
-    return it->second;
+    return pf;
 }
 
 Location ClangProject::toLocation(const std::string& absFile, int line, int col) const

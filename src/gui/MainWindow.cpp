@@ -41,6 +41,7 @@
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTextBlock>
+#include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
 #include <QToolTip>
@@ -271,6 +272,9 @@ void MainWindow::buildUi()
     // Files dock.
     files_ = new QTreeWidget;
     files_->setHeaderLabels({tr(""), tr("File"), tr("+/−"), tr("Δ")});
+    files_->setSelectionMode(QAbstractItemView::ExtendedSelection); // two files can be compared
+    files_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(files_, &QTreeWidget::customContextMenuRequested, this, &MainWindow::showFilesMenu);
     files_->setRootIsDecorated(false);
     files_->setUniformRowHeights(true);
     files_->header()->setSectionResizeMode(1, QHeaderView::Stretch);
@@ -318,6 +322,19 @@ void MainWindow::buildUi()
     updateChangesIndentation();
     changes_->setUniformRowHeights(true);
     changes_->setToolTip(tr("Click to show, double-click to compare with the original code"));
+    changes_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    changes_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(changes_, &QTreeWidget::customContextMenuRequested, this, &MainWindow::showChangesMenu);
+    auto* copyChange = new QAction(changes_);
+    copyChange->setShortcut(QKeySequence::Copy);
+    copyChange->setShortcutContext(Qt::WidgetShortcut);
+    connect(copyChange, &QAction::triggered, this, [this] { copyChanges(false); });
+    changes_->addAction(copyChange);
+    auto* copyDetails = new QAction(changes_);
+    copyDetails->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C));
+    copyDetails->setShortcutContext(Qt::WidgetShortcut);
+    connect(copyDetails, &QAction::triggered, this, [this] { copyChanges(true); });
+    changes_->addAction(copyDetails);
     cl->addWidget(changes_, 1);
     connect(changeFilter_, &QLineEdit::textChanged, this, &MainWindow::filterChanges);
     connect(hideTrivial_, &QCheckBox::toggled, this, &MainWindow::filterChanges);
@@ -507,6 +524,8 @@ void MainWindow::buildMenus()
     connect(semantic_, &QAction::toggled, this, &MainWindow::startReview);
     review->addAction(tr("Set &compile_commands.json…"), this, &MainWindow::chooseCompileDatabase);
     review->addSeparator();
+    review->addAction(tr("Compare Two &Files…"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_D), this,
+                      &MainWindow::pickFilesToCompare);
     review->addAction(tr("&Mark Hunk as Reviewed, Go to Next"), QKeySequence(Qt::CTRL | Qt::Key_Return), this, [this] {
         if (tabs_->currentWidget() == diff_ && !diff_->markHunkAtCursorReviewed())
             statusLabel_->setText(tr("No unreviewed hunk at or below the cursor"));
@@ -598,6 +617,17 @@ void MainWindow::buildMenus()
         themeGroup->addAction(a);
         const QString mode = QLatin1String(id);
         connect(a, &QAction::triggered, this, [this, mode] { setTheme(mode); });
+    }
+    auto* contextMenu = view->addMenu(tr("Context in &Comparisons"));
+    contextMenu->setToolTip(tr("Lines shown around a moved or extracted entity when comparing it with its origin"));
+    auto* contextGroup = new QActionGroup(contextMenu);
+    const int currentContext = QSettings().value(QStringLiteral("comparisonContext"), 10).toInt();
+    for (int n : {0, 5, 10, 25, 50}) {
+        auto* a = contextMenu->addAction(n == 0 ? tr("None") : tr("%n line(s)", nullptr, n));
+        a->setCheckable(true);
+        a->setChecked(n == currentContext);
+        contextGroup->addAction(a);
+        connect(a, &QAction::triggered, this, [n] { QSettings().setValue(QStringLiteral("comparisonContext"), n); });
     }
     view->addSeparator();
     view->addAction(tr("&Clear Highlights"), QKeySequence(Qt::Key_Escape), this, [this] {
@@ -1927,18 +1957,63 @@ void MainWindow::openComparison(const cr::Location& oldLoc, const cr::Location& 
     if (!state_ || !state_->result)
         return;
     // Diff the original fragment against the new one, even when they live in different files.
-    auto slice = [](const std::vector<std::string>& lines, const cr::Location& l) {
-        int b = std::clamp(l.line - 1, 0, static_cast<int>(lines.size()));
-        int e = std::clamp(std::max(l.line, l.endLine), b, static_cast<int>(lines.size()));
-        return std::vector<std::string>(lines.begin() + b, lines.begin() + e);
+    // Surrounding lines are shown on each side (dimmed) but not compared: the two places are unrelated.
+    const int context = QSettings().value(QStringLiteral("comparisonContext"), 10).toInt();
+    struct Slice {
+        int begin, end;               // the fragment, 0-based [begin, end)
+        int ctxBegin, ctxEnd;         // with context
     };
+    auto sliceOf = [context](const std::vector<std::string>& lines, const cr::Location& l) {
+        Slice s;
+        const int n = static_cast<int>(lines.size());
+        s.begin = std::clamp(l.line - 1, 0, n);
+        s.end = std::clamp(std::max(l.line, l.endLine), s.begin, n);
+        s.ctxBegin = std::max(0, s.begin - context);
+        s.ctxEnd = std::min(n, s.end + context);
+        return s;
+    };
+    const auto oldAll = fileLines(cr::Side::Old, q(oldLoc.file));
+    const auto newAll = fileLines(cr::Side::New, q(newLoc.file));
+    const auto os = sliceOf(oldAll, oldLoc), ns = sliceOf(newAll, newLoc);
+    cr::FileDiff core;
+    core.oldLines.assign(oldAll.begin() + os.begin, oldAll.begin() + os.end);
+    core.newLines.assign(newAll.begin() + ns.begin, newAll.begin() + ns.end);
+    cr::diffLines(core, ignoreWhitespace_->isChecked());
+
     cr::FileDiff fd;
     fd.oldPath = oldLoc.file;
     fd.newPath = newLoc.file;
-    fd.oldLines = slice(fileLines(cr::Side::Old, q(oldLoc.file)), oldLoc);
-    fd.newLines = slice(fileLines(cr::Side::New, q(newLoc.file)), newLoc);
-    cr::diffLines(fd, ignoreWhitespace_->isChecked());
-    // Apply the rename map so that rename-only lines are recognizable here too.
+    fd.oldLines.assign(oldAll.begin() + os.ctxBegin, oldAll.begin() + os.ctxEnd);
+    fd.newLines.assign(newAll.begin() + ns.ctxBegin, newAll.begin() + ns.ctxEnd);
+    fd.oldInfo.assign(fd.oldLines.size(), {});
+    fd.newInfo.assign(fd.newLines.size(), {});
+    const int oldPre = os.begin - os.ctxBegin, newPre = ns.begin - ns.ctxBegin;
+    fd.oldContentBegin = oldPre;
+    fd.oldContentEnd = oldPre + (os.end - os.begin);
+    fd.newContentBegin = newPre;
+    fd.newContentEnd = newPre + (ns.end - ns.begin);
+    // Context before, aligned to the fragment (the shorter side starts with fillers).
+    const int pre = std::max(oldPre, newPre);
+    for (int k = 0; k < pre; ++k) {
+        const int o = k - (pre - oldPre), n = k - (pre - newPre);
+        fd.rows.push_back({cr::RowKind::Equal, o >= 0 ? o : -1, n >= 0 ? n : -1});
+    }
+    for (const auto& row : core.rows) {
+        cr::DiffRow r = row;
+        if (r.oldLine >= 0) {
+            fd.oldInfo[static_cast<size_t>(oldPre + r.oldLine)] = core.oldInfo[static_cast<size_t>(r.oldLine)];
+            r.oldLine += oldPre;
+        }
+        if (r.newLine >= 0) {
+            fd.newInfo[static_cast<size_t>(newPre + r.newLine)] = core.newInfo[static_cast<size_t>(r.newLine)];
+            r.newLine += newPre;
+        }
+        fd.rows.push_back(r);
+    }
+    const int oldPost = os.ctxEnd - os.end, newPost = ns.ctxEnd - ns.end;
+    for (int k = 0; k < std::max(oldPost, newPost); ++k)
+        fd.rows.push_back({cr::RowKind::Equal, k < oldPost ? fd.oldContentEnd + k : -1, k < newPost ? fd.newContentEnd + k : -1});
+    // Apply the renames so that rename-only lines are recognizable here too.
     for (const auto& row : fd.rows) {
         if (row.kind != cr::RowKind::Modified)
             continue;
@@ -1958,12 +2033,19 @@ void MainWindow::openComparison(const cr::Location& oldLoc, const cr::Location& 
     connect(view, &DiffView::openFileRequested, this, &MainWindow::openWholeFile);
     QString title = QStringLiteral("<b>%1</b><br><span style='color:gray'>%2 &nbsp;⇄&nbsp; %3</span>")
                         .arg(esc(heading), esc(locText(oldLoc)), esc(locText(newLoc)));
-    view->showDiff(fd, title, oldLoc.line - 1, newLoc.line - 1);
+    view->showDiff(fd, title, os.ctxBegin, ns.ctxBegin);
     view->setSideCaptions(tr("Before: %1").arg(locText(oldLoc)), tr("After: %1").arg(locText(newLoc)));
     auto before = currentPosition();
     tabs_->addTab(view, tabTitle);
     tabs_->setTabToolTip(tabs_->indexOf(view), heading);
     tabs_->setCurrentWidget(view);
+    // Start at the fragment, with its context above.
+    QTimer::singleShot(0, view, [view, pre] {
+        for (auto* v : {view->view(cr::Side::Old), view->view(cr::Side::New)}) {
+            v->setTextCursor(QTextCursor(v->document()->findBlockByNumber(pre)));
+            v->verticalScrollBar()->setValue(std::max(0, pre - 3));
+        }
+    });
     if (before.valid()) {
         back_.push_back(before);
         forward_.clear();
@@ -2288,12 +2370,10 @@ void MainWindow::openWholeFile(cr::Side side, const QString& path, int line)
     pushHistory(before);
 }
 
-void MainWindow::openQuickOpen()
+QuickOpenDialog::FilesFn MainWindow::fileListProvider()
 {
-    if (!state_ || !state_->session || !state_->result)
-        return;
     auto st = state_;
-    auto files = [this, st](cr::Side side, std::function<void(QuickOpenDialog::Files)> done) {
+    return [this, st](cr::Side side, std::function<void(QuickOpenDialog::Files)> done) {
         auto* watcher = new QFutureWatcher<QuickOpenDialog::Files>(this);
         connect(watcher, &QFutureWatcher<QuickOpenDialog::Files>::finished, this, [watcher, done] {
             watcher->deleteLater();
@@ -2301,14 +2381,296 @@ void MainWindow::openQuickOpen()
         });
         watcher->setFuture(QtConcurrent::run([st, side] { return filesOf(*st, side); }));
     };
+}
+
+void MainWindow::openQuickOpen()
+{
+    if (!state_ || !state_->session || !state_->result)
+        return;
+    auto st = state_;
     const auto* v = activeCodeView();
-    QuickOpenDialog dlg(files, v ? v->side() : cr::Side::New, this);
+    QuickOpenDialog dlg(fileListProvider(), v ? v->side() : cr::Side::New, this);
     if (dlg.exec() != QDialog::Accepted || st != state_)
         return;
     cr::Location loc;
     loc.file = dlg.path().toStdString();
     loc.line = std::max(1, dlg.line());
     navigateTo(dlg.side(), loc);
+}
+
+void MainWindow::pickFilesToCompare()
+{
+    if (!state_ || !state_->session || !state_->result)
+        return;
+    auto st = state_;
+    QString paths[2];
+    for (auto side : {cr::Side::Old, cr::Side::New}) {
+        QuickOpenDialog dlg(fileListProvider(), side, this);
+        dlg.lockSide(side);
+        dlg.setWindowTitle(side == cr::Side::Old ? tr("Compare Files — Base File (left)")
+                                                 : tr("Compare Files — Target File (right)"));
+        if (dlg.exec() != QDialog::Accepted || st != state_)
+            return;
+        paths[side == cr::Side::Old ? 0 : 1] = dlg.path();
+    }
+    compareFiles(paths[0], paths[1]);
+}
+
+void MainWindow::compareFiles(const QString& basePath, const QString& targetPath)
+{
+    if (!state_ || !state_->session || !state_->result || basePath.isEmpty() || targetPath.isEmpty())
+        return;
+    auto st = state_;
+    cr::ChangedFile cf;
+    cf.oldPath = basePath.toStdString();
+    cf.newPath = targetPath.toStdString();
+    cf.status = cf.oldPath == cf.newPath ? 'M' : 'R';
+    cr::ReviewOptions options;
+    options.ignoreWhitespace = ignoreWhitespace_->isChecked();
+    options.semantic = semantic_->isChecked();
+    showProgress(tr("Comparing %1 with %2…").arg(QFileInfo(basePath).fileName(), QFileInfo(targetPath).fileName()), 0, 0);
+
+    using Result = std::shared_ptr<cr::ReviewResult>;
+    auto* watcher = new QFutureWatcher<Result>(this);
+    connect(watcher, &QFutureWatcher<Result>::finished, this, [this, watcher, st, basePath, targetPath] {
+        watcher->deleteLater();
+        if (st != state_)
+            return;
+        auto res = watcher->result();
+        if (!res || res->files.empty()) {
+            finishProgress(tr("Nothing to compare"));
+            return;
+        }
+        // The pair's own semantic changes, with their summary in the heading.
+        std::map<cr::ChangeKind, int> kinds;
+        for (const auto& c : res->changes)
+            if (!c.trivial)
+                ++kinds[c.kind];
+        QStringList summary;
+        for (auto kind : kGroupOrder)
+            if (auto it = kinds.find(kind); it != kinds.end())
+                summary << QStringLiteral("%1 %2").arg(it->second).arg(groupName(kind).toLower());
+        const auto& fd = res->files.front();
+        QString heading = tr("<b>%1</b> &nbsp;⇄&nbsp; <b>%2</b> &nbsp;<span style='color:gray'>+%3 −%4%5</span>")
+                              .arg(esc(basePath), esc(targetPath))
+                              .arg(fd.added)
+                              .arg(fd.removed)
+                              .arg(summary.isEmpty() ? QString() : QStringLiteral(" · ") + esc(summary.join(QStringLiteral(", "))));
+        auto* view = new DiffView;
+        view->setWordHighlights(highlightOld_, highlightNew_);
+        view->setChangeMetaProvider([res](int ch) {
+            ChangeMeta m;
+            if (ch < 0 || ch >= static_cast<int>(res->changes.size()))
+                return m;
+            const auto& c = res->changes[static_cast<size_t>(ch)];
+            m.badge = Theme::badge(c.kind);
+            m.color = Theme::current().changeColor(c.kind);
+            m.title = q(c.title);
+            return m;
+        });
+        connect(view, &DiffView::definitionRequested, this, &MainWindow::onDefinitionRequested);
+        connect(view, &DiffView::hoverRequested, this, &MainWindow::onHoverRequested);
+        connect(view, &DiffView::bookmarkRequested, this, &MainWindow::onBookmarkRequested);
+        connect(view, &DiffView::openFileRequested, this, &MainWindow::openWholeFile);
+        view->showDiff(fd, heading);
+        view->setSideCaptions(tr("Base: %1").arg(basePath), tr("Target: %1").arg(targetPath));
+        view->scrollToFirstChange();
+        auto before = currentPosition();
+        const QString title = QFileInfo(basePath).fileName() + QStringLiteral(" ⇄ ") + QFileInfo(targetPath).fileName();
+        tabs_->addTab(view, title);
+        QString tip = basePath + QStringLiteral(" ⇄ ") + targetPath;
+        for (const auto& c : res->changes)
+            if (!c.trivial)
+                tip += QStringLiteral("\n• ") + q(c.title);
+        tabs_->setTabToolTip(tabs_->indexOf(view), tip);
+        tabs_->setCurrentWidget(view);
+        pushHistory(before);
+        finishProgress(tr("%1 ⇄ %2: %n semantic change(s)", nullptr, static_cast<int>(res->changes.size()))
+                           .arg(basePath, targetPath));
+    });
+    watcher->setFuture(QtConcurrent::run([st, cf, options]() -> Result {
+        auto& s = *st->session;
+        return std::make_shared<cr::ReviewResult>(cr::computeReview({cf}, s.snapshot(cr::Side::Old), s.snapshot(cr::Side::New),
+                                                                     s.project(cr::Side::Old), s.project(cr::Side::New),
+                                                                     options, {}, &st->cancel));
+    }));
+}
+
+void MainWindow::showFilesMenu(QPoint pos)
+{
+    if (!state_ || !state_->result)
+        return;
+    const auto& files = state_->result->files;
+    auto fileOf = [&](QTreeWidgetItem* it) -> const cr::FileDiff* {
+        const int f = it->data(0, RoleFile).toInt();
+        return f >= 0 && f < static_cast<int>(files.size()) ? &files[static_cast<size_t>(f)] : nullptr;
+    };
+    auto items = files_->selectedItems();
+    if (items.isEmpty())
+        if (auto* it = files_->itemAt(pos))
+            items = {it};
+    QMenu menu;
+    addCopyPathActions(menu, items, fileOf);
+    // Interdiff rows are patches, not files of a revision: nothing to compare them with.
+    if (!state_->session || (state_->prs && state_->result == state_->prs->interdiff)) {
+        if (!menu.isEmpty())
+            menu.exec(files_->viewport()->mapToGlobal(pos));
+        return;
+    }
+    if (!menu.isEmpty())
+        menu.addSeparator();
+    const int copyActions = static_cast<int>(menu.actions().size());
+    if (items.size() == 2) {
+        // Base of one against the target of the other, both ways when possible.
+        const auto* a = fileOf(items[0]);
+        const auto* b = fileOf(items[1]);
+        for (auto [x, y] : {std::pair{a, b}, std::pair{b, a}})
+            if (x && y && !x->oldPath.empty() && !y->newPath.empty()) {
+                const QString basePath = q(x->oldPath), targetPath = q(y->newPath);
+                menu.addAction(tr("Compare Base %1 with Target %2").arg(QFileInfo(basePath).fileName(), QFileInfo(targetPath).fileName()),
+                               this, [this, basePath, targetPath] { compareFiles(basePath, targetPath); });
+            }
+    } else if (items.size() == 1) {
+        const auto* fd = fileOf(items[0]);
+        if (fd && !fd->oldPath.empty()) {
+            auto* sub = menu.addMenu(tr("Compare Base %1 With Target…").arg(QFileInfo(q(fd->oldPath)).fileName()));
+            const QString basePath = q(fd->oldPath);
+            for (const auto& other : files)
+                if (!other.newPath.empty() && other.newPath != fd->newPath)
+                    sub->addAction(q(other.newPath), this, [this, basePath, p = q(other.newPath)] { compareFiles(basePath, p); });
+            sub->addSeparator();
+            sub->addAction(tr("Other File…"), this, [this, basePath] {
+                QuickOpenDialog dlg(fileListProvider(), cr::Side::New, this);
+                dlg.lockSide(cr::Side::New);
+                dlg.setWindowTitle(tr("Compare %1 With Target File").arg(QFileInfo(basePath).fileName()));
+                if (dlg.exec() == QDialog::Accepted)
+                    compareFiles(basePath, dlg.path());
+            });
+        }
+        if (fd && !fd->newPath.empty()) {
+            auto* sub = menu.addMenu(tr("Compare Target %1 With Base…").arg(QFileInfo(q(fd->newPath)).fileName()));
+            const QString targetPath = q(fd->newPath);
+            for (const auto& other : files)
+                if (!other.oldPath.empty() && other.oldPath != fd->oldPath)
+                    sub->addAction(q(other.oldPath), this, [this, targetPath, p = q(other.oldPath)] { compareFiles(p, targetPath); });
+            sub->addSeparator();
+            sub->addAction(tr("Other File…"), this, [this, targetPath] {
+                QuickOpenDialog dlg(fileListProvider(), cr::Side::Old, this);
+                dlg.lockSide(cr::Side::Old);
+                dlg.setWindowTitle(tr("Compare %1 With Base File").arg(QFileInfo(targetPath).fileName()));
+                if (dlg.exec() == QDialog::Accepted)
+                    compareFiles(dlg.path(), targetPath);
+            });
+        }
+    }
+    if (menu.actions().size() == copyActions)
+        menu.addAction(tr("Select one or two files to compare"))->setEnabled(false);
+    menu.addSeparator();
+    menu.addAction(tr("Compare Two Files…"), this, &MainWindow::pickFilesToCompare);
+    menu.exec(files_->viewport()->mapToGlobal(pos));
+}
+
+void MainWindow::addCopyPathActions(QMenu& menu, const QList<QTreeWidgetItem*>& items,
+                                    const std::function<const cr::FileDiff*(QTreeWidgetItem*)>& fileOf)
+{
+    // Paths of the selected files: the target path, or the base path of a deleted file.
+    QStringList relative, absolute, basePaths;
+    for (auto* it : items) {
+        const auto* fd = fileOf(it);
+        if (!fd)
+            continue;
+        const bool hasNew = !fd->newPath.empty();
+        const QString path = q(hasNew ? fd->newPath : fd->oldPath);
+        relative << path;
+        if (!fd->oldPath.empty() && fd->oldPath != fd->newPath && hasNew)
+            basePaths << q(fd->oldPath);
+        // Absolute only when the file is on disk: a working tree or a compared directory.
+        const QString root = !hasNew && base_.kind == cr::Revision::Kind::Directory ? q(base_.ref)
+                             : target_.kind == cr::Revision::Kind::Directory       ? q(target_.ref)
+                             : repo_                                              ? q(repo_->root())
+                                                                                  : QString();
+        const QString abs = root.isEmpty() ? QString() : QDir(root).absoluteFilePath(path);
+        if (!abs.isEmpty() && QFileInfo::exists(abs))
+            absolute << abs;
+    }
+    if (relative.isEmpty())
+        return;
+    auto copy = [](const QStringList& paths) { QGuiApplication::clipboard()->setText(paths.join(QLatin1Char('\n'))); };
+    const bool many = relative.size() > 1;
+    menu.addAction(many ? tr("Copy Paths") : tr("Copy Path"), this, [copy, relative] { copy(relative); });
+    if (absolute.size() == relative.size())
+        menu.addAction(many ? tr("Copy Absolute Paths") : tr("Copy Absolute Path"), this, [copy, absolute] { copy(absolute); });
+    if (!basePaths.isEmpty())
+        menu.addAction(basePaths.size() > 1 ? tr("Copy Base Paths") : tr("Copy Base Path"), this,
+                       [copy, basePaths] { copy(basePaths); });
+    menu.addAction(many ? tr("Copy File Names") : tr("Copy File Name"), this, [copy, relative] {
+        QStringList names;
+        for (const auto& p : relative)
+            names << QFileInfo(p).fileName();
+        copy(names);
+    });
+}
+
+void MainWindow::showChangesMenu(QPoint pos)
+{
+    if (changes_->selectedItems().isEmpty())
+        if (auto* it = changes_->itemAt(pos))
+            changes_->setCurrentItem(it);
+    if (changes_->selectedItems().isEmpty())
+        return;
+    QMenu menu;
+    menu.addAction(tr("Copy\tCtrl+C"), this, [this] { copyChanges(false); });
+    menu.addAction(tr("Copy with Details\tCtrl+Shift+C"), this, [this] { copyChanges(true); });
+    menu.exec(changes_->viewport()->mapToGlobal(pos));
+}
+
+QString MainWindow::changeItemText(QTreeWidgetItem* it, bool details) const
+{
+    QString text = it->text(0);
+    if (!details || !state_ || !state_->result)
+        return text;
+    bool ok = false;
+    const int c = it->data(0, RoleChange).toInt(&ok);
+    const auto& changes = state_->result->changes;
+    if (!ok || c < 0 || c >= static_cast<int>(changes.size())) {
+        // A group heading: everything in it.
+        for (int i = 0; i < it->childCount(); ++i)
+            text += QStringLiteral("\n\n") + changeItemText(it->child(i), true);
+        return text;
+    }
+    const auto& ch = changes[static_cast<size_t>(c)];
+    bool isOcc = false;
+    const int occ = it->data(0, RoleOccurrence).toInt(&isOcc);
+    if (isOcc && occ >= 0 && occ < static_cast<int>(ch.related.size())) {
+        // An occurrence: its full locations, and the change it belongs to.
+        const auto& item = ch.related[static_cast<size_t>(occ)];
+        text = text.trimmed();
+        if (item.oldLoc.valid())
+            text += QStringLiteral("\n  Before: ") + locText(item.oldLoc);
+        if (item.newLoc.valid())
+            text += QStringLiteral("\n  After: ") + locText(item.newLoc);
+        text += QStringLiteral("\n  In: ") + q(ch.title);
+        return text;
+    }
+    if (ch.oldLoc.valid())
+        text += QStringLiteral("\n  Before: ") + locText(ch.oldLoc);
+    if (ch.newLoc.valid())
+        text += QStringLiteral("\n  After: ") + locText(ch.newLoc);
+    if (!ch.detail.empty())
+        text += QStringLiteral("\n  ") + q(ch.detail);
+    for (int i = 0; i < it->childCount(); ++i)
+        text += QStringLiteral("\n    ") + it->child(i)->text(0).trimmed();
+    return text;
+}
+
+void MainWindow::copyChanges(bool details)
+{
+    // In tree order, whatever order they were selected in.
+    QStringList parts;
+    for (QTreeWidgetItemIterator i(changes_, QTreeWidgetItemIterator::Selected); *i; ++i)
+        parts << changeItemText(*i, details);
+    if (!parts.isEmpty())
+        QGuiApplication::clipboard()->setText(parts.join(details ? QStringLiteral("\n\n") : QStringLiteral("\n")));
 }
 
 // ------------------------------------------------------------------------------------ search

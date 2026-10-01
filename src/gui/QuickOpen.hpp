@@ -27,6 +27,8 @@ public:
     QuickOpenDialog(FilesFn files, cr::Side side, QWidget* parent = nullptr);
 
     cr::Side side() const;
+    // Only files of the given revision (the revision choice is hidden).
+    void lockSide(cr::Side side);
     QString path() const { return path_; }
     int line() const { return line_; } // 1-based, 0 if not given
 
@@ -45,6 +47,7 @@ private:
     QRadioButton* target_;
     QRadioButton* base_;
     QLabel* info_;
+    QLabel* revisionLabel_;
     QString path_;
     int line_ = 0;
     int generation_ = 0;

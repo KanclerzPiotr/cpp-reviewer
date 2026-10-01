@@ -28,7 +28,8 @@ QuickOpenDialog::QuickOpenDialog(FilesFn files, cr::Side side, QWidget* parent)
     target_ = new QRadioButton(tr("Target"));
     base_ = new QRadioButton(tr("Base"));
     (side == cr::Side::Old ? base_ : target_)->setChecked(true);
-    sides->addWidget(new QLabel(tr("Revision:")));
+    revisionLabel_ = new QLabel(tr("Revision:"));
+    sides->addWidget(revisionLabel_);
     sides->addWidget(target_);
     sides->addWidget(base_);
     sides->addStretch(1);
@@ -43,6 +44,13 @@ QuickOpenDialog::QuickOpenDialog(FilesFn files, cr::Side side, QWidget* parent)
     connect(target_, &QRadioButton::toggled, this, &QuickOpenDialog::load);
     connect(list_, &QListWidget::itemActivated, this, &QuickOpenDialog::acceptCurrent);
     load();
+}
+
+void QuickOpenDialog::lockSide(cr::Side side)
+{
+    (side == cr::Side::Old ? base_ : target_)->setChecked(true);
+    for (QWidget* w : {static_cast<QWidget*>(base_), static_cast<QWidget*>(target_), static_cast<QWidget*>(revisionLabel_)})
+        w->setVisible(false);
 }
 
 cr::Side QuickOpenDialog::side() const

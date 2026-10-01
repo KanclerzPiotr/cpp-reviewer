@@ -7,6 +7,7 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -59,9 +60,28 @@ std::string absolutize(const std::string& p, const std::string& dir)
     return (fs::path(dir) / path).lexically_normal().string();
 }
 
+// absolutize() for the directory of one entry, remembering results: a database repeats the same
+// include directories in every entry, and normalizing them each time dominates loading.
+class Absolutizer {
+public:
+    const std::string& operator()(const std::string& p, const std::string& dir)
+    {
+        key_.assign(dir).push_back('\0');
+        key_.append(p);
+        auto it = cache_.find(key_);
+        if (it == cache_.end())
+            it = cache_.emplace(key_, absolutize(p, dir)).first;
+        return it->second;
+    }
+
+private:
+    std::string key_;
+    std::unordered_map<std::string, std::string> cache_;
+};
+
 // Keeps only flags that matter for parsing and makes path arguments absolute.
 std::vector<std::string> filterArgs(const std::vector<std::string>& raw, const std::string& dir,
-                                    const std::string& file)
+                                    const std::string& file, Absolutizer& abs)
 {
     static const std::set<std::string> dropWithValue = {"-o", "-MF", "-MT", "-MQ", "--serialize-diagnostics"};
     static const std::set<std::string> dropAlone = {"-c", "-MD", "-MMD", "-M", "-MM", "-MP", "-S", "-E",
@@ -70,6 +90,7 @@ std::vector<std::string> filterArgs(const std::vector<std::string>& raw, const s
                                                         "-imacros", "-isysroot", "--sysroot"};
     std::vector<std::string> out;
     const auto absFile = absolutize(file, dir);
+    const auto fileName = fs::path(file).filename().string();
     for (size_t i = 1; i < raw.size(); ++i) { // skip compiler executable
         const auto& a = raw[i];
         if (dropWithValue.count(a)) {
@@ -78,18 +99,19 @@ std::vector<std::string> filterArgs(const std::vector<std::string>& raw, const s
         }
         if (dropAlone.count(a) || a.rfind("-fdiagnostics-color", 0) == 0 || a.rfind("-Werror", 0) == 0)
             continue;
-        if (a == file || absolutize(a, dir) == absFile)
+        // The source file itself (only arguments ending with its name can be).
+        if (a == file || (a.ends_with(fileName) && absolutize(a, dir) == absFile))
             continue;
         if (pathWithValue.count(a) && i + 1 < raw.size()) {
             out.push_back(a);
-            out.push_back(absolutize(raw[++i], dir));
+            out.push_back(abs(raw[++i], dir));
             continue;
         }
         bool handled = false;
         for (const char* p : {"-I", "-isystem", "-iquote"}) {
             std::string pre(p);
             if (a.size() > pre.size() && a.rfind(pre, 0) == 0) {
-                out.push_back(pre + absolutize(a.substr(pre.size()), dir));
+                out.push_back(pre + abs(a.substr(pre.size()), dir));
                 handled = true;
                 break;
             }
@@ -146,6 +168,7 @@ bool CompileDatabase::load(const std::string& jsonPath, std::string* error)
     entries_.clear();
     byDir_.clear();
     path_ = jsonPath;
+    Absolutizer abs;
     for (const auto& item : root.arr()) {
         const auto& dir = item["directory"].str();
         const auto& file = item["file"].str();
@@ -158,9 +181,9 @@ bool CompileDatabase::load(const std::string& jsonPath, std::string* error)
         } else {
             raw = shellSplit(item["command"].str());
         }
-        auto abs = absolutize(file, dir);
-        entries_[abs] = Entry{filterArgs(raw, dir, file)};
-        byDir_.emplace(fs::path(abs).parent_path().string(), abs);
+        auto absFile = absolutize(file, dir);
+        entries_[absFile] = Entry{filterArgs(raw, dir, file, abs)};
+        byDir_.emplace(fs::path(absFile).parent_path().string(), absFile);
     }
     return true;
 }

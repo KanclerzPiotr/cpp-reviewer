@@ -28,6 +28,13 @@ struct SymbolInfo {
     std::optional<Location> includedFile; // for #include directives
 };
 
+// A file as it was when something was derived from it.
+struct FileStamp {
+    std::string path;
+    uint64_t size = 0;
+    uint64_t mtime = 0;
+};
+
 // libclang access for one revision: parses files on demand, keeps a bounded cache of
 // translation units for navigation and an optional project-wide symbol index.
 class ClangProject {
@@ -59,8 +66,14 @@ public:
     std::vector<Location> definitionsOf(const std::string& usr) const;
     std::vector<Location> declarationsOf(const std::string& usr) const;
 
+    int parseCacheHits() const { return parseCacheHits_; }
+
 private:
     struct Tu;
+    // Fills `deps` with every file the translation unit read (left empty when one can't be checked).
+    std::shared_ptr<ParsedFile> parseUncached(const std::string& relPath, const std::string& abs,
+                                              std::vector<FileStamp>* deps);
+    uint64_t parseCacheKey(const std::string& abs, const std::string& content) const;
     std::shared_ptr<Tu> acquireTu(const std::string& absPath, bool skipBodies);
     std::vector<std::string> argsFor(const std::string& absPath) const;
     std::string absPath(const std::string& file) const;
@@ -82,7 +95,7 @@ private:
     std::unordered_map<std::string, std::vector<Location>> defs_;
     std::unordered_map<std::string, std::vector<Location>> decls_;
     std::atomic<bool> indexReady_{false};
-    std::atomic<int> cacheHits_{0}, indexedFiles_{0};
+    std::atomic<int> cacheHits_{0}, indexedFiles_{0}, parseCacheHits_{0};
 };
 
 } // namespace cr

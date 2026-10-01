@@ -375,6 +375,9 @@ void DiffView::render()
         }
         RowData l, r;
         l.hunk = r.hunk = hunk;
+        auto outside = [](int line, int b, int e) { return b >= 0 && (line < b || line >= e); };
+        l.context = row.oldLine >= 0 && outside(row.oldLine, fd.oldContentBegin, fd.oldContentEnd);
+        r.context = row.newLine >= 0 && outside(row.newLine, fd.newContentBegin, fd.newContentEnd);
         if (row.oldLine >= 0) {
             const auto& text = fd.oldLines[static_cast<size_t>(row.oldLine)];
             lt << QString::fromStdString(text);

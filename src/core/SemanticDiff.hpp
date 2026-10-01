@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -24,7 +25,10 @@ struct SemanticInput {
 
 struct SemanticOutput {
     std::vector<SemanticChange> changes;
-    std::map<std::string, std::string> renames; // identifier renames: old -> new
+    std::map<std::string, std::string> renames; // identifier renames: old -> new (unambiguous ones)
+    // Every rename target of each old name; several when the name was split, e.g. a class whose
+    // methods moved to one new class while its uses now name another.
+    std::map<std::string, std::set<std::string>> renameTargets;
 };
 
 // Matches entities between revisions and classifies how they changed: renames, moves,

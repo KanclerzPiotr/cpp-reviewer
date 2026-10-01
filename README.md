@@ -115,6 +115,24 @@ The index is cached per file (by its content and compile flags). Another review 
 only parses the files that changed, which takes seconds instead of minutes; the status bar shows how
 many files came from the cache.
 
+The changed files themselves are parsed with full function bodies, and that result is cached too: by the
+file's content, its compile flags and the libclang version. Each entry also records every header the file
+included and is only reused while none of them has changed. Reopening a review or a saved session therefore
+skips libclang entirely (for example 7 s → 0.5 s for an 11-file pull request). The first Ctrl+Click into
+a file after that parses it once for navigation.
+
+**Comparing two chosen files:** when a file was split, e.g. `Foo.cpp` into `FooA.cpp` and `FooB.cpp`, the diff
+pairs the old file with one part only. Select two files in *Changed Files* (Ctrl+Click) and choose
+*Compare Base X with Target Y* from the context menu. You can also use *Compare Base … With Target…* on a single
+file, or *Review → Compare Two Files…* (Ctrl+Shift+D) to pick any two files. The base version of one is diffed against the target version
+of the other in a new tab, with semantic analysis of that pair.
+
+**Copying paths:** right-click files in *Changed Files* for *Copy Path* (repository-relative), *Copy Absolute
+Path* (when the file is on disk, e.g. in the working tree), *Copy Base Path* (the old path of a renamed file) and
+*Copy File Name*. With several files selected, each is copied on its own line.
+Likewise, right-click in *Semantic Changes* for *Copy* (the lines as shown) or *Copy with Details* (full paths
+and line ranges of both sides, and every occurrence), handy for pointing at a specific finding.
+
 **Ctrl+P** opens any file of either revision, not only the changed ones. Type parts of the path
 (`lowering hpp`), optionally followed by `:line`. *Open Whole File in Tab* in a diff's context menu opens the
 file under the cursor.
@@ -163,6 +181,8 @@ when you review a newer revision of the same branch or PR, and a hunk reappears 
 | Ctrl+F12 / Ctrl+Shift+Click | Go to declaration |
 | Alt+Left / Alt+Right | Back / forward |
 | Ctrl+P | Open any file |
+| Ctrl+Shift+D | Compare two files |
+| Ctrl+C / Ctrl+Shift+C | In *Semantic Changes*: copy the selected changes / with locations and occurrences |
 | Ctrl+F, F3 / Shift+F3 | Find in view, next / previous match |
 | Ctrl+Shift+F | Find in files |
 | Ctrl+K / Ctrl+Shift+K | Toggle bookmark / comment |
@@ -233,6 +253,7 @@ Everything lives under `~/.cache/cppreviewer/` (or `$XDG_CACHE_HOME/cppreviewer/
 | `reviewed/` | hunks and changes marked as reviewed, one file per repository |
 | `bookmarks/` | bookmarks and comments, one file per repository |
 | `symbols/` | symbol index results per file (content + flags) |
+| `parsed/` | parsed changed files: tokens and entities (content + flags + included headers) |
 | `repos/<host>/<owner>/<repo>.git` | download cache for pull requests of repositories you don't have locally |
 
 Everything there can be deleted at any time; it's rebuilt when needed. The repository itself is never

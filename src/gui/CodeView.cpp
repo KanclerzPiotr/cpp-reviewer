@@ -117,7 +117,8 @@ CodeView::CodeView(QWidget* parent) : QPlainTextEdit(parent)
         return out;
     });
 
-    highlighter_->setPlainProvider([this](int block) { return block >= 0 && block < rows_.size() && rows_[block].fold; });
+    highlighter_->setPlainProvider(
+        [this](int block) { return block >= 0 && block < rows_.size() && (rows_[block].fold || rows_[block].context); });
 
     connect(this, &QPlainTextEdit::blockCountChanged, this, &CodeView::updateGutterWidth);
     connect(this, &QPlainTextEdit::updateRequest, this, &CodeView::updateGutter);

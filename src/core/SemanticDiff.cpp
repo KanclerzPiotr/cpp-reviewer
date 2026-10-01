@@ -59,6 +59,7 @@ public:
         matchByIdentity();
         matchBySignatureChange();
         matchByNormalizedBody();
+        matchAcrossRenamedScopes();
         matchBySimilarity();
         matchClassesByMembers();
 
@@ -253,6 +254,9 @@ private:
         for (size_t j = 0; j < new_.size(); ++j)
             if (matchNew_[j] < 0)
                 byHash.emplace(N(static_cast<int>(j)).normHash, static_cast<int>(j));
+        // All candidate pairs first, then the best ones: an entity keeping its name must not lose its
+        // counterpart to an earlier one that merely has the same (α-renamed) body.
+        std::vector<std::tuple<int, int, int>> pairs; // rank, old, new
         for (size_t i = 0; i < old_.size(); ++i) {
             if (matchOld_[i] >= 0)
                 continue;
@@ -260,23 +264,62 @@ private:
             if (o.tokenCount() < 6)
                 continue;
             auto [b, e] = byHash.equal_range(o.normHash);
-            int best = -1;
-            int bestRank = -1;
             for (auto it = b; it != e; ++it) {
                 int j = it->second;
                 const auto& n = N(j);
-                if (matchNew_[static_cast<size_t>(j)] >= 0 || category(n) != category(o))
+                if (category(n) != category(o))
                     continue;
                 int rank = (n.name == o.name ? 2 : 0) + (sameFile(static_cast<int>(i), j) ? 1 : 0);
-                if (rank > bestRank) {
-                    bestRank = rank;
-                    best = j;
-                }
+                pairs.emplace_back(rank, static_cast<int>(i), j);
             }
-            if (best >= 0)
-                link(static_cast<int>(i), best, 3);
         }
+        std::stable_sort(pairs.begin(), pairs.end(), [](auto& a, auto& b) { return std::get<0>(a) > std::get<0>(b); });
+        for (auto [rank, i, j] : pairs)
+            if (matchOld_[static_cast<size_t>(i)] < 0 && matchNew_[static_cast<size_t>(j)] < 0)
+                link(i, j, 3);
     }
+
+    // Members keeping their name in a renamed (or split) class: the class correspondence is
+    // learned from members already matched, e.g. A::run() -> B::run() makes A::f() -> B::f() a
+    // candidate even when f()'s signature and body changed. The same goes for static data members.
+    void matchAcrossRenamedScopes()
+    {
+        std::map<std::string, std::set<std::string>> scopes; // old scope -> new scopes
+        for (size_t i = 0; i < old_.size(); ++i) {
+            const int j = matchOld_[i];
+            if (j < 0)
+                continue;
+            const auto& o = O(static_cast<int>(i));
+            const auto& n = N(j);
+            if (o.isMember && n.isMember && o.scope != n.scope)
+                scopes[o.scope].insert(n.scope);
+        }
+        if (scopes.empty())
+            return;
+        std::map<std::pair<std::string, std::string>, std::vector<int>> newByScopeName;
+        for (size_t j = 0; j < new_.size(); ++j)
+            if (const auto& n = N(static_cast<int>(j)); matchNew_[j] < 0 && n.isMember)
+                newByScopeName[{n.scope, n.name}].push_back(static_cast<int>(j));
+        std::vector<std::tuple<double, int, int>> pairs;
+        for (size_t i = 0; i < old_.size(); ++i) {
+            const auto& o = O(static_cast<int>(i));
+            if (matchOld_[i] >= 0 || !o.isMember)
+                continue;
+            auto sc = scopes.find(o.scope);
+            if (sc == scopes.end())
+                continue;
+            for (const auto& target : sc->second)
+                if (auto it = newByScopeName.find({target, o.name}); it != newByScopeName.end())
+                    for (int j : it->second)
+                        if (category(o) == category(N(j)))
+                            pairs.emplace_back(entitySimilarity(static_cast<int>(i), j), static_cast<int>(i), j);
+        }
+        std::sort(pairs.begin(), pairs.end(), [](auto& a, auto& b) { return std::get<0>(a) > std::get<0>(b); });
+        for (auto& [sim, i, j] : pairs)
+            if (sim >= 0.3 && matchOld_[static_cast<size_t>(i)] < 0 && matchNew_[static_cast<size_t>(j)] < 0)
+                link(i, j, kScopeRenamedPass, sim);
+    }
+    static constexpr int kScopeRenamedPass = 6;
 
     void matchBySimilarity()
     {
@@ -305,7 +348,13 @@ private:
                     pairs.emplace_back(s, i, j);
             }
         }
-        std::sort(pairs.begin(), pairs.end(), [](auto& a, auto& b) { return std::get<0>(a) > std::get<0>(b); });
+        // Near-identical bodies (e.g. emitWarning() and emitError() templates differing in one call)
+        // are told apart by their name: an entity keeping its name wins over an equally similar one.
+        auto rank = [&](const std::tuple<double, int, int>& p) {
+            const auto [s, i, j] = p;
+            return s + (O(i).name == N(j).name ? 0.15 : 0.0);
+        };
+        std::sort(pairs.begin(), pairs.end(), [&](auto& a, auto& b) { return rank(a) > rank(b); });
         for (auto& [s, i, j] : pairs)
             if (matchOld_[static_cast<size_t>(i)] < 0 && matchNew_[static_cast<size_t>(j)] < 0)
                 link(i, j, 4, s);
@@ -416,10 +465,12 @@ private:
             where = " from " + (o.scope.empty() ? std::string("global scope") : o.scope) + " to " +
                     (n.scope.empty() ? std::string("global scope") : n.scope);
 
-        if (pass == 2) {
+        if (pass == 2 || (pass == kScopeRenamedPass && o.params != n.params)) {
             c.kind = ChangeKind::SignatureChanged;
             c.title = "Changed signature of " + describe(o) + ": " + o.params + " → " + n.params;
-            if (fileMoved)
+            if (scopeMoved)
+                c.title += " (moved to " + n.scope + ")";
+            else if (fileMoved)
                 c.title += " (moved to " + n.file + ")";
         } else if (renamed && (fileMoved || scopeMoved)) {
             c.kind = ChangeKind::Moved;
@@ -854,6 +905,15 @@ private:
         for (auto& c : out_.changes) {
             fill(old_, c.oldName, c.oldLoc, c.memberClassOld, c.memberScopeOld);
             fill(new_, c.newName, c.newLoc, c.memberClassNew, c.memberScopeNew);
+            // A removed member is still referenced in the new code only through its class (if the
+            // class is still there), not by any other entity that happens to have the same name.
+            if (c.kind == ChangeKind::Removed && !c.memberClassOld.empty()) {
+                c.memberClassNew = c.memberClassOld;
+                const auto scope = c.oldName.substr(0, c.oldName.rfind("::"));
+                for (const auto& r : new_)
+                    if ((r.e->kind == EntityKind::Class && r.e->qualifiedName == scope) || r.e->scope == scope)
+                        c.memberScopeNew.push_back(locOf(*r.e));
+            }
         }
     }
 
@@ -861,6 +921,7 @@ private:
 
     struct RenameStats {
         int occurrences = 0;
+        double bestSimilarity = 0.0; // of the entity pairs it was seen in
         std::vector<std::string> places;
         Location firstOld, firstNew;
     };
@@ -920,6 +981,16 @@ private:
             const auto movedOld = consumedRanges(o, consumedOld_);
             const auto movedNew = consumedRanges(n, consumedNew_);
 
+            // Every identifier of each version of the entity: a renamed name is gone from the new
+            // version, and the new name wasn't used in the old one.
+            std::unordered_set<std::string> oldNames, newNames;
+            for (int t : opos)
+                if (ot[static_cast<size_t>(t)].kind == TokKind::Ident)
+                    oldNames.insert(ot[static_cast<size_t>(t)].text);
+            for (int t : npos)
+                if (nt[static_cast<size_t>(t)].kind == TokKind::Ident)
+                    newNames.insert(nt[static_cast<size_t>(t)].text);
+
             std::map<std::string, std::map<std::string, int>> votes;
             std::map<std::string, int> kept;
             std::map<std::string, std::pair<Location, Location>> firstSeen;
@@ -962,32 +1033,66 @@ private:
                 }
             }
             for (auto& [from, targets] : votes) {
-                if (targets.size() != 1 || kept[from] > 0)
+                if (targets.size() != 1 || kept[from] > 0 || newNames.count(from))
                     continue;
                 const auto& [to, count] = *targets.begin();
-                if (kept.count(to) && kept[to] > 0 && from.size() > 0) {
-                    // `to` already existed unchanged here: more likely a different symbol was used.
+                if (oldNames.count(to)) // `to` was already used here: more likely a different symbol
                     continue;
-                }
                 auto& st = accepted[{from, to}];
                 if (st.occurrences == 0) {
                     st.firstOld = firstSeen[from].first;
                     st.firstNew = firstSeen[from].second;
                 }
                 st.occurrences += count;
+                st.bestSimilarity = std::max(st.bestSimilarity, scoreOld_[i]);
                 st.places.push_back(displayName(n));
             }
         }
 
+        // Weak or contradictory evidence isn't a rename.
+        auto usedIn = [](const std::vector<EntityRef>& side) {
+            std::unordered_set<std::string> names;
+            std::unordered_set<const ParsedFile*> seen;
+            for (const auto& r : side)
+                if (seen.insert(r.file).second)
+                    for (const auto& t : r.file->tokens)
+                        if (t.kind == TokKind::Ident)
+                            names.insert(t.text);
+            return names;
+        };
+        const auto oldUsed = usedIn(old_), newUsed = usedIn(new_);
+        std::vector<std::pair<std::string, std::string>> rejected;
+        for (const auto& [pair, st] : accepted) {
+            const auto& [from, to] = pair;
+            const bool swapped = accepted.count({to, from}) > 0;               // X → Y and Y → X
+            const bool lone = st.occurrences == 1 && st.bestSimilarity < 0.8; // one token of a loosely matched entity
+            const bool bothKept = st.occurrences <= 2 && newUsed.count(from) && oldUsed.count(to); // both used before and after
+            if (swapped || lone || bothKept)
+                rejected.push_back(pair);
+        }
+        for (const auto& pair : rejected)
+            accepted.erase(pair);
+
         std::set<std::pair<std::string, std::string>> entityPairs(entityRenames_.begin(), entityRenames_.end());
-        std::map<std::string, std::set<std::string>> targets;
+        // The rename map (used for rename-only lines, also in non-C++ files) needs one target per
+        // name. When a name has several, e.g. a class split in two whose name lives on in one part,
+        // the clearly best supported one wins: identifier renames count their occurrences, an entity
+        // rename counts as two.
+        std::map<std::string, std::map<std::string, int>> targets;
         for (auto& [pair, st] : accepted)
-            targets[pair.first].insert(pair.second);
+            targets[pair.first][pair.second] += st.occurrences;
         for (auto& [from, to] : entityRenames_)
-            targets[from].insert(to);
-        for (auto& [from, tos] : targets)
-            if (tos.size() == 1)
-                out_.renames[from] = *tos.begin();
+            targets[from][to] += 2;
+        for (auto& [from, tos] : targets) {
+            for (auto& [to, weight] : tos)
+                out_.renameTargets[from].insert(to);
+            std::vector<std::pair<int, std::string>> ranked;
+            for (auto& [to, weight] : tos)
+                ranked.emplace_back(weight, to);
+            std::sort(ranked.rbegin(), ranked.rend());
+            if (ranked.size() == 1 || ranked[0].first >= 2 * ranked[1].first)
+                out_.renames[from] = ranked[0].second;
+        }
 
         for (auto& [pair, st] : accepted) {
             if (entityPairs.count(pair))

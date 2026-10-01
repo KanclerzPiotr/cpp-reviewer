@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Bookmarks.hpp"
+#include "QuickOpen.hpp"
 #include "Sessions.hpp"
 #include "CodeView.hpp"
 #include "core/PrCompare.hpp"
@@ -12,11 +13,13 @@
 #include <QMainWindow>
 #include <QPointer>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 
 class QLabel;
+class QMenu;
 class QLineEdit;
 class QProgressBar;
 class QTabWidget;
@@ -58,6 +61,10 @@ public:
     // any window exists; MainWindow::setTheme also re-colors open views.
     static void applyAppTheme(const QString& mode);
     void setTheme(const QString& mode);
+
+    // Diff of `basePath` in the base revision against `targetPath` in the target, with semantic
+    // analysis of that pair (e.g. one part of a file that was split in two).
+    void compareFiles(const QString& basePath, const QString& targetPath);
 
     // Test/demo hooks.
     void activateChangeByTitle(const QString& substring, bool compare);
@@ -167,6 +174,14 @@ private:
     void findInView(bool backward);
     void closeFindBar();
     void openQuickOpen();
+    QuickOpenDialog::FilesFn fileListProvider();
+    void pickFilesToCompare();
+    void showFilesMenu(QPoint pos);
+    void showChangesMenu(QPoint pos);
+    QString changeItemText(QTreeWidgetItem* it, bool details) const;
+    void copyChanges(bool details);
+    void addCopyPathActions(QMenu& menu, const QList<QTreeWidgetItem*>& items,
+                            const std::function<const cr::FileDiff*(QTreeWidgetItem*)>& fileOf);
     void startFileSearch();
 
     // Bookmarks.

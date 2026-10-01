@@ -23,6 +23,7 @@ struct RowData {
     int display = -1;  // line number to show instead of line + 1 (0: none), for generated text
     int hunk = -1;     // index of the diff hunk the row belongs to
     bool fold = false; // placeholder for a hunk hidden as reviewed (line == -1)
+    bool context = false; // surrounding lines, shown dimmed
 };
 
 struct ChangeMeta {

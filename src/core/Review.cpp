@@ -311,12 +311,113 @@ std::vector<MovedBlock> detectMovedLines(ReviewResult& r)
     return blocks;
 }
 
+namespace {
+
+// Whether two lines differ only by renames (same words otherwise).
+bool renameOnlyLine(const std::string& a, const std::string& b, const std::map<std::string, std::set<std::string>>& targets)
+{
+    std::vector<Word> wa, wb;
+    for (auto& w : splitWords(a))
+        if (!w.space)
+            wa.push_back(w);
+    for (auto& w : splitWords(b))
+        if (!w.space)
+            wb.push_back(w);
+    if (wa.size() != wb.size())
+        return false;
+    bool renamed = false;
+    for (size_t k = 0; k < wa.size(); ++k) {
+        auto ta = a.substr(static_cast<size_t>(wa[k].begin), static_cast<size_t>(wa[k].end - wa[k].begin));
+        auto tb = b.substr(static_cast<size_t>(wb[k].begin), static_cast<size_t>(wb[k].end - wb[k].begin));
+        if (ta == tb)
+            continue;
+        if (!wa[k].ident || !isRenamedWord(ta, tb, targets))
+            return false;
+        renamed = true;
+    }
+    return renamed;
+}
+
+// The line diff pairs removed and added lines by textual similarity, so a line that is one long
+// renamed identifier (MYLIB_OldName_SOURCES) stays unpaired. Pair such lines, keeping the order
+// of the existing pairs, so they can be recognized as rename-only.
+void pairRenamedLines(FileDiff& fd, const std::map<std::string, std::set<std::string>>& targets)
+{
+    std::vector<DiffRow> out;
+    out.reserve(fd.rows.size());
+    for (size_t r = 0; r < fd.rows.size();) {
+        if (fd.rows[r].kind == RowKind::Equal) {
+            out.push_back(fd.rows[r++]);
+            continue;
+        }
+        size_t e = r;
+        while (e < fd.rows.size() && fd.rows[e].kind != RowKind::Equal)
+            ++e;
+        std::vector<int> olds, news;             // lines of the block, in order
+        std::vector<std::pair<int, int>> pairs;  // (old index, new index) into olds/news
+        for (size_t k = r; k < e; ++k) {
+            const auto& row = fd.rows[k];
+            if (row.kind == RowKind::Modified)
+                pairs.emplace_back(static_cast<int>(olds.size()), static_cast<int>(news.size()));
+            if (row.oldLine >= 0)
+                olds.push_back(row.oldLine);
+            if (row.newLine >= 0)
+                news.push_back(row.newLine);
+        }
+        // Between consecutive existing pairs, pair unpaired lines that differ only by renames.
+        std::vector<std::pair<int, int>> all;
+        int lastA = -1, lastB = -1;
+        auto fill = [&](int endA, int endB) {
+            int b = lastB + 1;
+            for (int a = lastA + 1; a < endA; ++a)
+                for (int bb = b; bb < endB; ++bb)
+                    if (renameOnlyLine(fd.oldLines[static_cast<size_t>(olds[static_cast<size_t>(a)])],
+                                       fd.newLines[static_cast<size_t>(news[static_cast<size_t>(bb)])], targets)) {
+                        all.emplace_back(a, bb);
+                        b = bb + 1;
+                        break;
+                    }
+        };
+        for (auto [a, b] : pairs) {
+            fill(a, b);
+            all.emplace_back(a, b);
+            lastA = a;
+            lastB = b;
+        }
+        fill(static_cast<int>(olds.size()), static_cast<int>(news.size()));
+        if (all.size() == pairs.size()) { // nothing new
+            out.insert(out.end(), fd.rows.begin() + static_cast<long>(r), fd.rows.begin() + static_cast<long>(e));
+            r = e;
+            continue;
+        }
+        int a = 0, b = 0;
+        auto emitUntil = [&](int ea, int eb) {
+            for (; a < ea; ++a)
+                out.push_back({RowKind::Deleted, olds[static_cast<size_t>(a)], -1});
+            for (; b < eb; ++b)
+                out.push_back({RowKind::Inserted, -1, news[static_cast<size_t>(b)]});
+        };
+        for (auto [pa, pb] : all) {
+            emitUntil(pa, pb);
+            out.push_back({RowKind::Modified, olds[static_cast<size_t>(a++)], news[static_cast<size_t>(b++)]});
+        }
+        emitUntil(static_cast<int>(olds.size()), static_cast<int>(news.size()));
+        r = e;
+    }
+    fd.rows = std::move(out);
+}
+
+} // namespace
+
 // Lines whose only difference is a consistent rename get their own tag, linked to the
 // change that reports the rename.
 void markRenameOnlyLines(ReviewResult& r)
 {
-    if (r.renames.empty())
+    if (r.renameTargets.empty())
         return;
+    for (auto& fd : r.files)
+        if (!fd.synthetic)
+            pairRenamedLines(fd, r.renameTargets);
     auto simple = [](const std::string& qualified) {
         auto p = qualified.rfind("::");
         return p == std::string::npos ? qualified : qualified.substr(p + 2);
@@ -352,10 +453,10 @@ void markRenameOnlyLines(ReviewResult& r)
                 auto tb = b.substr(static_cast<size_t>(wb[k].begin), static_cast<size_t>(wb[k].end - wb[k].begin));
                 if (ta == tb)
                     continue;
-                auto it = r.renames.find(ta);
-                if (wa[k].ident && it != r.renames.end() && it->second == tb) {
+                std::string from, to;
+                if (wa[k].ident && isRenamedWord(ta, tb, r.renameTargets, &from, &to)) {
                     renamedSomething = true;
-                    if (auto o = owner.find({ta, tb}); change < 0 && o != owner.end())
+                    if (auto o = owner.find({from, to}); change < 0 && o != owner.end())
                         change = o->second;
                 } else {
                     ok = false;
@@ -401,6 +502,8 @@ bool overlaps(const Location& loc, const std::string& file, int begin, int end)
 void collectRenameOccurrences(const ReviewResult& r, const std::vector<MovedBlock>& blocks, SemanticChange& c,
                               const std::string& from, const std::string& to)
 {
+    // Whole words, or renamed parts of longer identifiers (MYLIB_OldName_SOURCES in CMake files).
+    const std::map<std::string, std::set<std::string>> rename{{from, {to}}};
     auto scan = [&](const FileDiff& of, int oldLine, const FileDiff& nf, int newLine) {
         const auto& a = of.oldLines[static_cast<size_t>(oldLine)];
         const auto& b = nf.newLines[static_cast<size_t>(newLine)];
@@ -423,8 +526,8 @@ void collectRenameOccurrences(const ReviewResult& r, const std::vector<MovedBloc
             for (int m = 0; m < d.aEnd - d.aBegin; ++m) {
                 const auto& x = na[static_cast<size_t>(d.aBegin + m)];
                 const auto& y = nb[static_cast<size_t>(ins.bBegin + m)];
-                if (a.compare(static_cast<size_t>(x.begin), static_cast<size_t>(x.end - x.begin), from) == 0 &&
-                    b.compare(static_cast<size_t>(y.begin), static_cast<size_t>(y.end - y.begin), to) == 0) {
+                if (isRenamedWord(a.substr(static_cast<size_t>(x.begin), static_cast<size_t>(x.end - x.begin)),
+                                  b.substr(static_cast<size_t>(y.begin), static_cast<size_t>(y.end - y.begin)), rename)) {
                     c.related.push_back({"renamed", {of.oldPath, oldLine + 1, x.begin + 1, 0, false},
                                          {nf.newPath, newLine + 1, y.begin + 1, 0, false}});
                 }
@@ -443,6 +546,17 @@ void collectRenameOccurrences(const ReviewResult& r, const std::vector<MovedBloc
     std::stable_sort(c.related.begin(), c.related.end(), [](const RelatedItem& x, const RelatedItem& y) {
         return std::tie(x.newLoc.file, x.newLoc.line, x.newLoc.col) < std::tie(y.newLoc.file, y.newLoc.line, y.newLoc.col);
     });
+    // The count in the title comes from the C++ analysis; mention the rest (build files, tests...).
+    int others = 0;
+    std::set<std::string> otherFiles;
+    for (const auto& it : c.related)
+        if (it.label == "renamed" && !isCppFile(it.newLoc.file)) {
+            ++others;
+            otherFiles.insert(it.newLoc.file);
+        }
+    if (others > 0)
+        c.title += ", +" + std::to_string(others) + " in " +
+                   (otherFiles.size() == 1 ? *otherFiles.begin() : std::to_string(otherFiles.size()) + " other files");
 }
 
 bool isCppKeyword(const std::string& w)
@@ -706,6 +820,104 @@ void buildRelated(ReviewResult& r, const std::vector<MovedBlock>& blocks)
 
 } // namespace
 
+namespace {
+
+bool isUpper(char c)
+{
+    return c >= 'A' && c <= 'Z';
+}
+
+bool isLowerOrDigit(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+}
+
+} // namespace
+
+namespace {
+
+// Whether `from` at `p` in `word` is a complete part of it (see renameInWord).
+bool isPartAt(const std::string& word, size_t p, const std::string& from)
+{
+    if (from.size() < 4 || word.compare(p, from.size(), from) != 0)
+        return false;
+    const size_t e = p + from.size();
+    const bool left = p == 0 || word[p - 1] == '_' || (isUpper(from.front()) && isLowerOrDigit(word[p - 1]));
+    const bool right = e == word.size() || word[e] == '_' || (isUpper(word[e]) && isLowerOrDigit(from.back())) ||
+                       (isUpper(word[e]) && isUpper(from.back()) && e + 1 < word.size() && isLowerOrDigit(word[e + 1]));
+    return left && right;
+}
+
+} // namespace
+
+bool isRenamedWord(const std::string& a, const std::string& b,
+                   const std::map<std::string, std::set<std::string>>& targets, std::string* from, std::string* to)
+{
+    if (auto it = targets.find(a); it != targets.end() && it->second.count(b)) {
+        if (from)
+            *from = a;
+        if (to)
+            *to = b;
+        return true;
+    }
+    for (const auto& [f, tos] : targets) {
+        if (f.size() < 4 || a.find(f) == std::string::npos)
+            continue;
+        for (const auto& t : tos) {
+            // Every complete part naming `f` renamed to `t`.
+            std::string out;
+            bool changed = false;
+            for (size_t p = 0; p < a.size();) {
+                if (isPartAt(a, p, f)) {
+                    out += t;
+                    p += f.size();
+                    changed = true;
+                } else {
+                    out += a[p++];
+                }
+            }
+            if (changed && out == b) {
+                if (from)
+                    *from = f;
+                if (to)
+                    *to = t;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::string renameInWord(const std::string& word, const std::map<std::string, std::string>& renames,
+                         std::string* used)
+{
+    if (auto it = renames.find(word); it != renames.end()) {
+        if (used)
+            *used = it->first;
+        return it->second;
+    }
+    // A renamed name as a part of a longer identifier, e.g. MYLIB_OldName_SOURCES or OldNamePass.
+    // Parts are delimited by the word's ends, '_' and camelCase; short names only match whole words.
+    std::string out;
+    bool changed = false;
+    for (size_t p = 0; p < word.size();) {
+        const std::pair<const std::string, std::string>* match = nullptr;
+        for (const auto& r : renames)
+            if ((!match || r.first.size() > match->first.size()) && isPartAt(word, p, r.first))
+                match = &r;
+        if (match) {
+            out += match->second;
+            p += match->first.size();
+            if (used && !changed)
+                *used = match->first;
+            changed = true;
+        } else {
+            out += word[p++];
+        }
+    }
+    return changed ? out : word;
+}
+
 std::string applyRenames(const std::string& line, const std::map<std::string, std::string>& renames)
 {
     if (renames.empty())
@@ -717,9 +929,7 @@ std::string applyRenames(const std::string& line, const std::map<std::string, st
             size_t j = i;
             while (j < line.size() && isWordChar(line[j]))
                 ++j;
-            auto word = line.substr(i, j - i);
-            auto it = renames.find(word);
-            out += it == renames.end() ? word : it->second;
+            out += renameInWord(line.substr(i, j - i), renames);
             i = j;
         } else {
             out += line[i++];
@@ -848,6 +1058,7 @@ ReviewResult computeReview(const std::vector<ChangedFile>& changed, const Snapsh
         auto out = analyzeEntities(in);
         r.changes = std::move(out.changes);
         r.renames = std::move(out.renames);
+        r.renameTargets = std::move(out.renameTargets);
     }
 
     // 4. Text-level moves and rename-only lines.
